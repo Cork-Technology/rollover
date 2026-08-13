@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    actor K as Keeper
+    participant S as Settler
+
+    K->>S: refund(orderId, originData)
+    S->>S: status = orderStatus[orderId]
+    alt status not in {Opened, Closing}
+        S-->>K: revert Settler__OrderInTerminalState
+    end
+    S->>S: abi.decode → orderData; _orderDigestMemory == orderId (else Settler__OrderIdMismatch)
+    S->>S: block.timestamp > fillDeadline (else Settler__NotExpired)
+    alt !allowPartialFills AND exactFill.premiumFired
+        S-->>K: revert Settler__PremiumAlreadyFiredRefundBlocked
+    end
+    S->>S: orderStatus[orderId] = Refunded
+    S-->>K: emit: OrderRefunded(orderId)
+    Note right of S: No tokens move at Settler. Async dstCST escrow remains reachable via reclaim after the deadline.

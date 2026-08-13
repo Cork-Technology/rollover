@@ -1,0 +1,28 @@
+sequenceDiagram
+    autonumber
+    actor K as Keeper (anyone)
+    participant S as Settler
+    participant DST as dstCST
+    participant CL as orderData.rolloverContract (cPT holder RolloverContract)
+
+    K->>S: reclaim(orderId, defaulterFiller, subFiller, originData)
+    S->>S: status = orderStatus[orderId]
+    alt status not in {Refunded, Closing, Opened, None}
+        S-->>K: revert Settler__OrderNotStopped
+    end
+    S->>S: abi.decode → orderData; _orderDigestMemory == orderId (else Settler__OrderIdMismatch)
+    S->>S: block.timestamp > fillDeadline (else Settler__FillerStillInFlight)
+    alt allowPartialFills
+        S->>S: rec = fillerRollovers[id][defaulterFiller]
+        S->>S: !rec.premiumFired (else Settler__NoResidualToReclaim)
+        S->>S: !fillerSettled[id][defaulterFiller] (else Settler__NoResidualToReclaim)
+        S->>S: amount = fillerDstCstResidual[id][defaulterFiller]; amount != 0
+        S->>S: CEI — fillerSettled = true; fillerDstCstResidual = 0; totalDstCstEscrowed -= amount
+    else exact-mode
+        S->>S: !exactFill.premiumFired (else Settler__NoResidualToReclaim)
+        S->>S: amount = dstCstResidual[id]; amount != 0
+        S->>S: dstCstResidual[id] = 0
+    end
+    S-->>DST: token: safeTransfer(S → orderData.rolloverContract, amount) — INV-DEFAULTER-RECOUP, INV-DST-CST-REACHABLE
+    S-->>K: emit: DefaulterResidualReclaimed(orderId, defaulter, orderData.rolloverContract, amount)
+    Note right of S: Status intentionally unchanged — zeroed residual is the idempotency guard

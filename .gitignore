@@ -1,0 +1,33 @@
+# local tooling / editor / OS artifacts
+out/
+cache/
+broadcast/
+forge-cache/
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.scratch.md
+.local-cache/
+
+# env
+.env
+.env.local
+
+# local working artifacts
+.revalidation-prompt.md
+.probe-prompt.md
+.scratchpad/
+.codeintel/
+.cqs/
+.certora-diagnostics/
+.certora_internal/
+.certora_mutate_sources/
+cvt_conf_for_certoraMutate.conf
+splitStatsdata.json
+zip_output_certora_mutate.tar.gz
+collect.json
+gambit_out/
+
+# understand-anything scratch (commit the graph, not the working dirs)
+.understand-anything/tmp/

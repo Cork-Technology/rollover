@@ -1,0 +1,33 @@
+sequenceDiagram
+    autonumber
+    actor F as Filler / Executor
+    participant S as Settler
+    participant FA as Factory
+    participant C as RolloverContract
+    participant SRC as srcCST
+    participant P as premiumToken
+
+    F->>S: fill(orderId, originData, fillerData[ATOMIC_TAG envelope])
+    S->>S: peekTag == ATOMIC_TAG
+    S->>S: LibFillerPayloadExternal.decodeAtomicPayloads(...)
+    S->>S: isAuthorised(...)
+    S->>S: admit (None→Opened) + _handleRolloverFill
+    F-->>SRC: token: srcCST.safeTransferFrom(F → C, fillAmount)
+    S->>FA: executeIntentHooks(ROLLOVER)
+    FA->>C: _handlePhaseRollover — hooks, unwind, deposit, dstCST → params.settler
+    C-->>S: (actualRolled, dstProduced, srcLeftover)
+    S->>S: dst delivery check; _writePartialFillRecord
+    S-->>F: emit: RolloverLegFilled
+
+    S->>S: requiredPremium = ceil(dstProduced * minPremiumPerShare / 1e18); pin premium ≤ premiumCap
+    S->>S: latch rec.premiumFired BEFORE factory dispatch
+    F-->>P: token: premium.safeTransferFrom(F → C, requiredPremium)
+    S->>S: rolloverContract balance delta == requiredPremium (else Settler__PremiumDeliveryMismatch)
+    S->>FA: executeIntentHooks(PREMIUM) — direct; hook revert cascades
+    FA->>C: _handlePhasePremium
+    C->>C: !premiumFiredFor[digest][F][ctx.subFiller]; latch resolved subFiller
+    C->>C: standing-balance tripwire on premiumHooks (INV-PREMIUM-HOOKS-CANNOT-SWEEP-STANDING-BALANCE)
+    C-->>FA: emit: PremiumFired(digest, filler, ctx.subFiller, premium)
+    FA-->>S: success
+    S-->>F: emit: PremiumLegFilled
+    S->>S: settle filler slot — dstCST → fillerDestination

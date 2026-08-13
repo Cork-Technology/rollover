@@ -1,0 +1,47 @@
+sequenceDiagram
+    autonumber
+    participant FA as Factory
+    participant C as RolloverContract
+    participant REG as ERC-7484 Registry
+    participant H_PRE as preRolloverHooks[]
+    participant H_MID as midRolloverHooks[]
+    participant H_POST as postRolloverHooks[]
+    participant H_PRM as premiumHooks[]
+    participant PMs as srcPoolManager
+    participant PMd as dstPoolManager
+
+    FA->>C: executeIntentHooks(orderDigest, phase, intent, sig, ctx, orderData) [onlyFactory]
+    C->>C: _validateFillEnvelope (intent.rolloverContract == this; ctx.originSettler == factory.originatingSettler; deadlines; ctx.filler != 0)
+    C->>C: _validateIntentHashBinding (intent.orderDigest == orderDigest; intentStructHash(intent) == ctx.rolloverIntentHash)
+    C->>C: _ensureOwnerAuthorized — checks cPT-holder signature on every dispatch
+
+    alt phase == PREMIUM
+        Note over C: premium already at rolloverContract from Settler direct F→C transfer
+        C->>C: _handlePhasePremium — !premiumFiredFor[digest][filler][ctx.subFiller]; latch
+        C->>C: snapshot preBalance; _executeIntentCalls(premiumHooks, MODULE_TYPE_EXECUTOR)
+        loop each hook
+            C->>REG: check(hook.target, MODULE_TYPE_EXECUTOR)
+            C->>H_PRM: delegatecall(callData) — must not mutate live-trust hash
+        end
+        C->>C: postBalance >= preBalance (standing-balance tripwire)
+        C-->>FA: emit: PremiumFired(orderDigest, filler, ctx.subFiller, premium)
+    else phase == ROLLOVER
+        C->>C: _validateRolloverPreflight — PHASE_0_TERMINAL_BIT not set; fillAmount != 0; rolled+fill <= orderSize; src/dst PoolId match; signed settler pin checked earlier [INV-PARAMS-SETTLER-PIN]
+        C->>C: _prevalidateIntentCalls(pre/mid/post) — ERC-7484 attester per bucket; codesize > 0; delegate-only; no value; no allowFailure
+        C->>C: _populateScratch — snapshots srcCST/srcCPT/dstCST/dstCPT/caDst, derive PoolManagers + sibling CPTs
+        C->>H_PRE: _executeIntentCalls(preRolloverHooks, MODULE_TYPE_PRE_ROLLOVER_HOOK) — sources srcCPT
+        C->>PMs: unwindMint(srcPoolId, sharesToBurn, this, this) — burns srcCST+srcCPT, mints CA
+        C->>C: caReceived >= params.minCaReceived
+        C->>H_MID: _executeIntentCalls(midRolloverHooks, MODULE_TYPE_MID_ROLLOVER_HOOK)
+        C->>C: caSrc unconstrained across mid bracket (cross-CA supported); seal caDstAfterMid [DSR-2]
+        C->>PMd: deposit(dstPoolId, caForDeposit, this) — mints dstCST + dstCPT
+        C->>C: dstProduced >= params.minSharesOut [INV-DST-FLOOR]; actualRolled vs fillAmount per allowUnderfill
+        C->>C: rolled += actualRolled; set PHASE_0_TERMINAL_BIT if rolled==orderSize OR !allowPartialFills
+        C-->>FA: token: dstCST.safeTransfer(C → params.settler, dstProduced)
+        C-->>FA: token: srcCST.safeTransfer(C → params.settler, srcLeftover) if > 0
+        C->>H_POST: _executeIntentCalls(postRolloverHooks, MODULE_TYPE_POST_ROLLOVER_HOOK) — consume dstCPT
+        C->>C: dstCpt.balanceOf(C) <= dstCptBefore [INV-CPT-CONTAINED]
+        C->>C: dstCstAfter >= dstCstBefore [INV-5, MidPhaseDstCstDrain]
+        C-->>FA: (actualRolled, dstProduced, srcLeftover)
+        C-->>FA: emit: RolloverLegSettled; emit: HookPhaseExecuted
+    end

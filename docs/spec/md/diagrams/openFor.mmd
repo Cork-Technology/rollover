@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    actor U as User (cPT holder)
+    participant R as Relayer / Filler
+    participant S as Settler
+    participant FA as Factory
+    participant PM as IPoolShare(srcCST/dstCST)
+
+    U->>R: [sig] OrderData (EIP-712)
+    R->>S: openFor(order, signature, originFillerData)
+    Note over S: originFillerData is intentionally ignored — pass-through for ERC-7683
+    S->>S: _validateOrder → _validateOrderCommon
+    S->>FA: isDeployedRolloverContract(orderData.rolloverContract)
+    S->>PM: poolId() / expiry() on src + dst
+    S->>S: SignatureChecker.isValidSignatureNow(orderData.user, digest, sig)
+    alt status == Opened
+        S-->>R: idempotent no-op
+    else _blocksRollover(status)
+        S-->>R: revert Settler__OrderInTerminalState
+    else
+        S->>S: orderStatus[digest] = Opened
+        S-->>R: emit: Open(digest, resolvedOrder)
+    end

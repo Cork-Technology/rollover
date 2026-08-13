@@ -1,0 +1,26 @@
+sequenceDiagram
+    autonumber
+    actor U as cPT holder
+    actor R as Relayer / cPT holder
+    participant S as Settler
+
+    U->>R: [sig] CancelOrder (EIP-712: orderId, orderSalt) [or cPT holder calls directly]
+    R->>S: cancel(orderId, originData, cptHolderSig)
+    S->>S: status = orderStatus[orderId]
+    alt _isHardTerminal(status) OR status == Closing
+        S-->>R: revert Settler__OrderInTerminalState
+    end
+    S->>S: abi.decode → orderData; _orderDigestMemory == orderId (else Settler__OrderIdMismatch)
+    S->>S: cancelDigest = _hashTypedDataV4(LibSettlerHashing.hashCancelOrder(orderId, orderSalt))
+    S->>S: SignatureChecker.isValidSignatureNow(orderData.user, cancelDigest, cptHolderSig) (else Settler__UnauthorizedCancel)
+    S->>S: hasFills = allowPartialFills ? (totalDstCstEscrowed!=0) : (exactFill.dstCstProduced!=0)
+    alt hasFills AND !allowPartialFills
+        S-->>R: revert Settler__OrderHasFills
+    else hasFills AND allowPartialFills
+        S->>S: orderStatus = Closing
+        S-->>R: emit: OrderClosing(orderId)
+    else no fills
+        S->>S: orderStatus = Cancelled
+        S-->>R: emit: OrderCancelled(orderId)
+    end
+    Note right of S: Closing is soft-terminal — _blocksRollover(Closing)=true (no new fills) but _isHardTerminal(Closing)=false (reclaim/refund still reachable)

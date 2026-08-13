@@ -1,0 +1,79 @@
+%%{init: {"theme": "default", "themeVariables": {"fontSize": "13px"}}}%%
+flowchart LR
+  %% ===== Actors =====
+  CptHolder(["cPT holder<br/>(off-chain signer)"])
+  Filler(["Filler<br/>(EOA / SCW)"])
+
+  %% ===== Contracts =====
+  BF["BaseFiller"]
+  %% EvcRolloverAdapter is adapter/integration context only and out of audit scope
+  %% unless explicitly re-added in SCOPE.md; it is omitted from the in-scope flow.
+  Settler["Settler"]
+  Factory["CorkRolloverContractFactory"]
+  RolloverContract["CorkRolloverContract (cPT holder clone)"]
+  PoolMgr[("Phoenix PoolManager")]
+
+  %% ===== Tokens =====
+  srcCST{{"srcCST<br/>(filler holdings)"}}
+  dstCST{{"dstCST<br/>(produced by rolloverContract)"}}
+  premToken{{"Premium token"}}
+
+  %% ===== Off-chain authorisation =====
+  CptHolder ==>|"sign OrderData<br/>(rolloverIntentHash)"| Filler
+  CptHolder ==>|"sign RolloverIntent<br/>(pre/mid/post/premium hooks)"| Filler
+  CptHolder ==>|"sign FillerAuth<br/>(orderDigest, destination, subFiller)"| Filler
+
+  %% ===== Entry =====
+  Filler -->|"execute(job)"| BF
+  BF -->|"openFor(order, userSig)"| Settler
+  Settler -->|"FSM: None → Opened"| Settler
+
+  %% ===== ROLLOVER leg =====
+  BF -.->|"safeTransferFrom srcCST"| srcCST
+  srcCST -.->|"pull"| BF
+  BF -->|"fill(ROLLOVER fillerData<br/>+ fillerAuthSig + minDstPerSrc)"| Settler
+  Settler -.->|"srcCST: filler→Settler→rolloverContract"| RolloverContract
+  Settler -->|"executeIntentHooks(ROLLOVER)"| Factory
+  Factory -->|"INV-SETTLER-APPROVED<br/>+ phase allowlist<br/>+ origin latch"| RolloverContract
+  RolloverContract -->|"preRolloverHooks<br/>(delegatecall · ERC-7484 gate)"| RolloverContract
+  RolloverContract -->|"unwindMint(srcPoolId)<br/>burns srcCST+srcCPT"| PoolMgr
+  PoolMgr ...>|"CA-src delta (DSR-1)"| RolloverContract
+  RolloverContract -->|"midRolloverHooks<br/>(CA composition)"| RolloverContract
+  RolloverContract -->|"deposit(dstPoolId, caIn)<br/>mints dstCST+dstCPT"| PoolMgr
+  PoolMgr -.->|"dstCST → rolloverContract"| dstCST
+  RolloverContract -.->|"safeTransfer dstCST →<br/>params.settler"| Settler
+  RolloverContract -->|"postRolloverHooks<br/>(consume dstCPT; INV-CPT-CONTAINED)"| RolloverContract
+  Settler ...>|"INV-DSTCST-FLOOR<br/>(minDstPerSrc check)"| Settler
+
+  %% ===== PREMIUM leg =====
+  BF ...>|"read fillerDstProducedOf"| Settler
+  BF -.->|"safeTransferFrom premium (Ceil)"| premToken
+  BF -->|"fill(PREMIUM fillerData)"| Settler
+  Settler -->|"latch premiumFired"| Settler
+  Settler -.->|"premium: filler→rolloverContract"| premToken
+  premToken -.->|"delta check<br/>(PremiumDeliveryMismatch)"| RolloverContract
+  Settler -->|"executeIntentHooks(PREMIUM)"| Factory
+  Factory -->|"rolloverContract-local premiumFiredFor latch (success-only)"| RolloverContract
+  RolloverContract -->|"delegatecall premiumHooks<br/>(cPT holder discretion)"| RolloverContract
+
+  %% ===== In-frame settlement after PREMIUM =====
+  Settler -->|"_settleModeSpecific(orderId, filler, subFiller)"| Settler
+  Settler -.->|"safeTransfer dstCST →<br/>fillerDestination[id][filler]"| Filler
+  Settler -->|"FSM: Opened → Settled<br/>(exact) or per-filler latch (partial)"| Settler
+
+  %% ===== Refund / Cancel / Reclaim =====
+  Filler -->|"refund(orderId)<br/>after fillDeadline"| Settler
+  CptHolder ==>|"sign CancelOrder"| Filler
+  Filler -->|"cancel(orderId, cptHolderSig, originData)"| Settler
+  Filler -->|"reclaim(orderId, defaulterFiller)<br/>after fillDeadline,<br/>FSM ∈ {None,Opened,Refunded,Closing}"| Settler
+  Settler -.->|"dstCST → orderData.rolloverContract<br/>(INV-DEFAULTER-RECOUP)"| RolloverContract
+
+  %% ===== Styling =====
+  classDef actor fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+  classDef token fill:#fff8e1,stroke:#f9a825,stroke-width:2px;
+  classDef contract fill:#f5f5f5,stroke:#333;
+  classDef external fill:#fce4ec,stroke:#c2185b,stroke-dasharray: 4 2;
+  class CptHolder,Filler actor;
+  class srcCST,dstCST,premToken token;
+  class BF,Settler,Factory,RolloverContract contract;
+  class PoolMgr external;

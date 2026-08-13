@@ -1,0 +1,851 @@
+# Cork Rollover Deployment Runbook
+
+## 1. The silence pattern — read this first
+
+The Cork rollover boot sequence is a **three-domain coordination
+problem with no single revert as a forcing function**. Cork's factory checks
+its own state, Phoenix's pool manager checks its own state, and the
+Rhinestone ERC-7484 registry checks its own state. Every individual contract
+can return clean tx receipts for a sequence that the *protocol as a whole*
+cannot make a single fill flow through.
+
+Deploy-time success ≠ first-fill success. A misconfigured deployment can
+have a green-looking Cork state (`approvedSettlers == true`,
+`isDeployedRolloverContract == true`, a populated `rolloverContractSnapshot().liveTrustAttesters`,
+non-empty `defaultAttesters()`) and still revert on the first user fill
+because the selected Phoenix market/pool is absent or mismatched, an attester
+has not published an attestation for the hook target, or only one of the two
+concrete settlers has been approved.
+
+**The release gate for this codebase is
+`FOUNDRY_PROFILE=deploy forge script script/verify-deploy.s.sol`, not any
+individual contract's view function.** The deployer and verifier must use this
+same compiler profile because the exact bootstrap artifact bytecode is a
+provenance input. No deploy is considered live until the deploy-profile script
+exits 0 against the target chain.
+
+## 2. Boot-order rail (lane diagram)
+
+```
+Lane A (Phoenix)     │ Lane B (ERC-7484)   │ Lane C (Cork Factory) │ Lane D (cPT holder RolloverContract)
+─────────────────────┼─────────────────────┼───────────────────────┼──────────────────────
+A1 market published  │                     │                       │
+A2 shares() verified │                     │                       │
+                     │ B1 registry alive   │                       │
+                     │ B2 attesters set    │                       │
+                     │                     │ C1 factory deployed   │
+                     │                     │ C2 impl bound         │
+                     │                     │ C3 defaults validated │
+                     │                     │ C4 Settlers approved  │
+                     │                     │                       │ D1 deployRolloverContract()
+                     │                     │                       │ D2 seed verified
+                     │ B3 hooks attested   │                       │ (cross-lane wait on D1)
+                     │                     │                       │ D3 simulate fill
+                     │                     │                       │ D4 hold configured delay ─ no queue
+                     │                     │                       │ D5 release genesis
+```
+
+Two cross-lane gates carry the silence pattern:
+
+- **B3 can use D1's predicted address, but D1 still seeds trust state** — attesters can
+  prepare `(rolloverContract, hookTarget, moduleType)` rows against the predicted
+  rolloverContract address; the clone's smart-account record becomes live through the
+  one-shot `IERC7484.trustAttesters` call inside `initialize`.
+- **D3 waits on A2 + B3 + C4** — the end-to-end fill simulation can only
+  succeed once the selected Phoenix market/pool matches its configured shares,
+  attesters have published module-type attestations, and both concrete Settlers
+  are on the factory allowlist. No PoolManager rollover-contract whitelist step
+  exists in this campaign.
+
+Each lane step maps to a literal command:
+
+| Step | Literal command (or external dependency) |
+|---|---|
+| A1 | Phoenix admin publishes the pool. |
+| A2 | `FOUNDRY_PROFILE=deploy forge script script/verify-deploy.s.sol --sig 'run()'` (gate 3). |
+| B1 | Rhinestone deploys / operates the registry. |
+| B2 | Default attesters live on the registry. |
+| B3 | Each attester publishes `(rolloverContract, hookTarget, moduleType)` attestations. |
+| C1 | Predict the factory address, deploy/configure the external trust-config timelock for that address, then `new CorkRolloverContractFactory(impl, registry, threshold, defaults, trustConfigTimelock, ensOwner, factoryAdmin, defaultsManager, settlerApprover, settlerRevoker)`. |
+| C1a | Link/deploy `LibFillerPayloadExternal` for the concrete Settler artifacts. |
+| C2 | Implementation address baked into factory at construction. |
+| C3 | `defaultAttesters()` non-empty + threshold ≤ length. |
+| C4 | `factory.approveSettler(exactSettler)` and `factory.approveSettler(partialSettler)` from `SETTLER_APPROVER_ROLE`. |
+| D1 | cPT holder checks `factory.predictRolloverContractOf(cptHolder)`, then calls `factory.deployRolloverContract()`. |
+| D2 | `factory.rolloverContractConfig(rolloverContract).owner == cptHolder`. |
+| D3 | `FOUNDRY_PROFILE=deploy forge script script/verify-deploy.s.sol --sig 'run()'` (gates 1–4) + the anvil probe in §4 for gate 5. |
+| D4 | Confirm Gate 1 reports the live timelock delay as exactly `3600` and Gate 2 reports `factory.pendingTrustConfig(rolloverContract) == (0, [], 0)`. After an applied trust-config change, hold the configured 3,600-second window and rerun verification. |
+| D5 | Broadcast the first user fill. |
+
+## 3. Boot-order traps
+
+Two misconfigurations have green Cork-side state and revert only on the
+first fill. Each entry: symptom, silent state, first revert selector,
+recovery action.
+
+### Trap 1 — Genesis Settler missing
+
+- **Symptom:** `deployRolloverContract()` succeeds; the first fill reverts.
+- **Silent state:** `isDeployedRolloverContract(rolloverContract) == true`, but
+  `approvedSettlers(exactSettler) == false` or
+  `approvedSettlers(partialSettler) == false`.
+- **First revert:** `CorkRolloverContractFactory__SettlerNotApproved(settler)` inside
+  `executeIntentHooks`.
+- **Recovery:** approve both concrete settlers from `SETTLER_APPROVER_ROLE`.
+
+### Trap 2 — Hook target not attested for its bucket
+
+- **Symptom:** a signed intent succeeds in a unit test against a mocked
+  registry; the same intent reverts on-chain on the first fill.
+- **Silent state:** `rolloverContractSnapshot().liveTrustAttesters` mirrors the
+  factory defaults; `defaultAttesters()` non-empty.
+- **First revert:** `CorkRolloverContract__ModuleTypeMismatch(target, expectedModuleType)`
+  on the rolloverContract's per-batch `IERC7484.check` call.
+- **Recovery:** the attester publishes the missing `(rolloverContract, hookTarget, moduleType)`
+  attestation through the registry's attestation surface.
+
+### M-05 — Removed full-balance premium executors
+
+New premium intents must not depend on removed full-balance premium modules.
+`TransferAllModule` and `SplitModule` are removed and obsolete for new-order
+hook templates; keep premium payout hooks amount-scoped through
+`ScopedTransferModule` or `ScopedSplitModule`. There are no live signed intents
+in this remediation branch, so deployment must not attest removed full-balance
+premium modules for new orders.
+
+### OwnerTokenPullModule operator note
+
+Deploy `OwnerTokenPullModule` as an immutable stateless module and attest it
+only under `MODULE_TYPE_PRE_ROLLOVER_HOOK` / `0xc0c0_0001`. The cPT holder's
+ERC-20 allowance must be granted to the rollover contract, not to the module,
+because the module runs through delegatecall and calls `transferFrom(owner,
+address(this), amount)` from the rollover contract context. In module calldata,
+`amount` is exact when `allowUnderfill=false`; when `allowUnderfill=true`,
+`amount` is a maximum and the module pulls the smaller positive value across the
+signed maximum, the owner's token balance, and the owner's allowance to the
+rollover contract. The module does not infer fill size and does not perform
+rollover accounting; actual underfill accounting remains in `_unwindLeg`.
+
+## 4. Release gate — `script/verify-deploy.s.sol`
+
+The release gate is a Forge script. **The script's exit code IS the release
+signal** — `0` means release-ready, non-zero means blocked. Block-explorer
+eyeballing or Discord pings are NOT sufficient.
+
+### Greenfield-only release policy
+
+This release is greenfield-only. The verifier must be run against:
+
+- fresh `ExactSettler` and `PartialSettler` deployments;
+- a fresh `CorkRolloverContractFactory`;
+- fresh `CorkRolloverContract` clones deployed by that factory.
+
+Do not use this release gate to approve proxy upgrades, in-place reuse of
+populated legacy storage, legacy factory/rolloverContract reparenting, or live-state
+migration. Any future live-state migration needs a separate written spec,
+storage-compatibility tests, and its own release gate before production use.
+
+### Repository deployment entrypoint
+
+`script/deploy-staging.s.sol:DeployStaging` is the dual-chain greenfield
+entrypoint. Its checked JSON input follows either
+`script/config/base-staging.example.json` (`profile = "base"`, chain `8453`) or
+`script/config/arbitrum-staging.example.json` (`profile = "arbitrum"`, chain
+`42161`). Arbitrum is the first executable deployment gate. Base preparation
+may run in parallel, but Base's live gate waits for committed Arbitrum
+deployment evidence. The document contains public deployment inputs only:
+never place a private key, seed, mnemonic, PIN, passphrase, signature, signed
+transaction, credential-bearing URL, or Ledger transport/session/derivation data in it.
+Missing keys are rejected separately from present zero values. The two external
+dependency `codehash` fields are mandatory runtime fingerprints; zero is
+rejected and never disables comparison.
+
+The input binds two typed signer identities before any apply:
+
+- `signers.deployer` must use `ledger` with public sender
+  `0x72D3Dfc7855691d69FBf79d2e510D40d662AAE1E`;
+- `signers.governance` must use `ledger`;
+- each binding carries its public `sender`, a non-empty **non-secret** backend
+  `reference`, the selected profile's `chainId`, and the expected pre-apply
+  `nonce`.
+
+The typed loader represents both `ledger` and `foundry-encrypted-keystore`
+without accepting raw keys. This campaign selects Ledger for both bindings and
+rejects an encrypted-keystore binding during preflight.
+
+The deployer and governance signer are separate. The governance signer must be
+one of the three ordered Safe owners; the deployer must not be a Safe owner,
+default attester, or final authority. A backend reference is an operator-facing
+alias, not signing material, and the script never interprets it as a key.
+
+Planning validates the complete config, explicit profile/chain pairing, both
+signer bindings, external runtime code and hashes, principal separation, Safe
+owner shape, deterministic nonces and salts, and fill-probe completeness. On
+Arbitrum One it first requires the selected Ledger deployment sender
+`0x72D3Dfc7855691d69FBf79d2e510D40d662AAE1E`, before deriving any nonce-bound
+address. If the predicted bootstrap-deployer or bootstrap address is occupied,
+planning requires the exact repository runtime at both addresses. The bootstrap
+address is derived from the deployer nonce, the bootstrap-deployer address, the
+fixed CREATE2 salt, and exact config-hash/deployer-bound bootstrap initcode.
+Planning separately hashes the complete, address-bound initcode set for the
+Factory and every component. `run(string)` binds that reviewed commitment once
+on the bootstrap before the first component CREATE/CREATE2. On resume,
+`CONFIG_HASH` and `DEPLOYMENT_ARTIFACTS_HASH` must equal the requested config
+and freshly planned initcode set. Any occupied Factory must also match the
+locally reconstructed artifact runtime after applying the reviewed
+implementation and trust-timelock immutables; its bootstrap-recorded codehash
+is evidence, not a self-authenticating trust anchor. The bootstrap lifecycle
+must be deployer-owned while partial or ownerless when finalized. These checks
+prevent a resume from combining a substituted or old Factory with newly built
+components, and fail before any missing-component broadcast.
+Planning does not start a broadcast:
+
+```bash
+FOUNDRY_PROFILE=deploy forge script \
+  script/deploy-staging.s.sol:DeployStaging \
+  --sig 'plan(string)' script/config/arbitrum-staging.json \
+  --rpc-url "$READ_ONLY_RPC_URL"
+```
+
+Before the bootstrap is created, `run(string)` revalidates both live signer
+nonces immediately before apply. Once that authenticated config- and
+artifact-bound bootstrap exists, same-config resume and verification rely on
+its stored commitments; unrelated later signer nonce changes do not alter the
+checked config.
+This campaign remains blocked from broadcast until
+the non-secret signer backend reference, unresolved public principals,
+immutable exact-commit approval, and the release recipe are durably selected. Do not infer them from
+the example files. A later approved operator invocation must select the signer
+out of band; never add `--private-key` or put secret material in repository
+configuration.
+
+The script deploys `LibFillerPayloadExternal` once, patches that one address
+into both concrete Settler artifacts, deploys the implementation and Settlers,
+deploys a 3,600-second governance/trust timelock for the predicted Factory,
+deploys the Factory and canonical settlement modules (`ApproveModule`,
+`OwnerTokenPullModule`, `ScopedTransferModule`, `ScopedSplitModule`, and
+`PostRolloverDstCptTransferModule`), approves both Settlers, hands roles to the
+configured principals, and renounces all bootstrap authority. It then runs the
+same Factory/Settler/timelock assertions used by `verify-deploy.s.sol`.
+Re-running the same config against a finalized bootstrap performs verification
+only.
+
+Production `LibFillerPayloadExternal` addresses are intentionally not recorded
+here: each remains a release-instance output until the reviewed per-chain
+rehearsal fixes the real deployer nonce and deploy-profile bytecode.
+
+### Verification invocation
+
+```bash
+FOUNDRY_PROFILE=deploy forge script script/verify-deploy.s.sol \
+  --sig 'run()' \
+  --rpc-url "$RPC_URL"
+```
+
+Gate 5 is a real, non-broadcast local simulation. Supply the public signed order
+payload and expected balance deltas through the `FILL_*` inputs, then run:
+
+```bash
+FOUNDRY_PROFILE=deploy forge script script/verify-deploy.s.sol \
+  --sig 'runWithFillSimulation()' \
+  --rpc-url "$RPC_URL"
+```
+
+The gate first proves the identical payload fails from
+`FILL_UNAUTHORIZED_FILLER`, then executes the atomic ExactSettler fill as
+`FILL_FILLER`. It checks exact source debit, destination recipient credit,
+premium debit and recipient credit, and preservation of the unused
+`FILL_PREMIUM_CAP` remainder. It uses only public payload/signature bytes and
+local caller impersonation; it never broadcasts the fill or reads private
+material.
+
+### Linked library requirement
+
+`ExactSettler` and `PartialSettler` contain link references to
+`src/libraries/LibFillerPayloadExternal.sol:LibFillerPayloadExternal`. The
+repository entrypoint deploys it once and links both concrete Settler artifacts
+to that address before any transaction is generated. The size gate proves only
+that the linked runtime is EIP-170 compliant.
+
+### Settler authority wiring
+
+`ExactSettler` and `PartialSettler` use the same campaign authority mapping:
+
+| Surface | Required principal |
+|---|---|
+| `owner()` / `ensOwner_` | dedicated display identity |
+| `DEFAULT_ADMIN_ROLE` and `RECOVERY_ROLE` | 3,600-second governance/trust timelock |
+| `PAUSER_ROLE` | dedicated pause-only signer |
+| `UNPAUSER_ROLE` | M1 |
+
+The display identity is metadata only. It has no governance, attestation,
+custody, deployer, pause, user, filler, or pilot-funding consequence. The
+pause-only signer can pause but cannot unpause or acquire another authority by
+virtue of that role. Both concrete Settlers must use the same checked mapping.
+
+### Factory authority wiring
+
+`CorkRolloverContractFactory` uses AccessControl for factory-wide operations.
+The one-shot bootstrap temporarily holds only the roles needed to deploy and
+approve the canonical Settlers. Finalization wires the exact campaign graph:
+
+| Factory surface | Required principal |
+|---|---|
+| `owner()` | dedicated display identity |
+| `DEFAULT_ADMIN_ROLE` | 3,600-second governance/trust timelock |
+| `DEFAULTS_MANAGER_ROLE` | 3,600-second governance/trust timelock |
+| `TRUST_CONFIG_DELAY_MANAGER_ROLE` | 3,600-second governance/trust timelock |
+| `SETTLER_APPROVER_ROLE` | 3,600-second governance/trust timelock |
+| `SETTLER_REVOKER_ROLE` | M2 |
+
+M1 directly holds none of the four delayed Factory/Settler surfaces. M1 may
+reach Factory administration, defaults, Settler approval, and Settler
+admin/recovery only by scheduling, waiting at least 3,600 seconds, and executing
+through the timelock. M1's only direct Rollover authorities are Settler unpause
+and the sole ERC-7484 attester position (threshold `1`). M2's only direct
+Rollover authority is Settler revocation. The treasury has pilot custody only
+and no protocol authority.
+
+The same `TimelockController` is the Factory administration authority and the
+factory's immutable trust-config timelock. It is initialized with exactly a
+3,600-second minimum delay. M1 holds its proposer, canceller, executor, and
+administrative roles; the predicted Factory additionally holds proposer,
+canceller, and executor roles so canonical trust-config queue/apply flows work.
+Execution is not open to `address(0)`, and no campaign principal other than M1
+may be an alternate timelock caller.
+
+The Factory-governed delay-update flow remains
+`queueTrustConfigDelayUpdate(newDelay)`, `cancelTrustConfigDelayUpdate()`, and
+`applyTrustConfigDelayUpdate()`. The source-level protocol permits bounded
+delay updates, but the campaign verifier requires the live delay to remain
+exactly `3600`; a queued update or a changed delay blocks release. Normal trust
+configuration uses `queueFactoryDefaultTrustConfig` / `queueTrustConfig` /
+`applyTrustConfig` / `cancelTrustConfig`.
+
+`DEFAULTS_MANAGER_ROLE` can call `setDefaults(threshold, attesters, registry)`,
+but because the role holder is the timelock, M1 cannot call it directly.
+Existing rolloverContracts keep their deployment-time registry and live trust
+config; `setDefaults` affects only future `deployRolloverContract()` calls.
+
+Every configured principal is independently represented. Preflight fails
+closed on any forbidden alias among M1, M2, treasury, pause signer, display
+identity, governance signer, deployer, or ordered Safe owners. It also rejects
+the deployer as a Safe owner or default attester. Final verification proves the
+deployer and bootstrap own no Factory or Settler role and no ownership.
+
+Canonical `ExactSettler` and `PartialSettler` deployments are the supported
+default. `approveSettler` is an address/code allowlist, not a behavioral
+verifier, so custom Settlers require explicit conformance approval before they
+are added to the factory allowlist. That review must verify the canonical
+settlement discipline end to end: srcCST predeposit into the rolloverContract,
+dstCST delivery to the Settler, srcLeftover return/refund to the Settler, the
+signed-settler pin used by the rolloverContract, and premium/dst release
+semantics matching the canonical Settlers.
+
+Before deploying the Factory, the script predicts its address from the bound
+deployer and nonce, then deploys and configures the timelock for that address.
+The Factory constructor enforces code presence and canonical Factory
+proposer/canceller/executor wiring. The campaign verifier additionally enforces:
+
+- `getMinDelay() == 3600`;
+- M1 has proposer, canceller, executor, and administrative roles;
+- the predicted Factory has proposer, canceller, and executor roles;
+- `address(0)` is not an executor;
+- M2, treasury, pause signer, display identity, governance signer, deployer, and
+  bootstrap have no timelock caller or administrative role;
+- no trust-config delay update is queued.
+
+OZ `AccessControl` is not enumerable, so the verifier checks every known
+campaign principal and the deterministic deployment actors. Immutable
+deployment evidence must also account for role-grant history before release.
+Any direct M1 assignment to Factory admin/defaults/approval or Settler
+admin/recovery, any alternate caller, or any live delay other than `3600` fails
+closed.
+
+### Local fill rehearsal
+
+Run `runWithFillSimulation()` against a fresh local Anvil snapshot after setting
+all gate 0–4 variables and the gate-5 variables listed below. The script uses
+`vm.prank` only in the local simulation and does not broadcast the fill:
+
+```bash
+FOUNDRY_PROFILE=deploy forge script script/verify-deploy.s.sol \
+  --sig 'runWithFillSimulation()' \
+  --rpc-url http://localhost:8545
+```
+
+### Env-var schema
+
+| Name | Type | When required | Source of truth |
+|---|---|---|---|
+| `FACTORY` | address | always | Factory deployment receipt. |
+| `REGISTRY` | address | always | ERC-7484 registry address baked into the factory. |
+| `EXACT_SETTLER` | address | always | ExactSettler operator expects on the allowlist. |
+| `PARTIAL_SETTLER` | address | always | PartialSettler operator expects on the allowlist. |
+| `TRUST_CONFIG_TIMELOCK` | address | always | Shared 3,600-second governance/trust `TimelockController` baked into the Factory. |
+| `M1` | address | always | Expected sole direct attester/unpauser and sole campaign timelock controller. |
+| `M2` | address | always | Expected direct Settler revoker. |
+| `TREASURY` | address | always | Pilot treasury; expected to hold no protocol role. |
+| `PAUSE_SIGNER` | address | always | Dedicated direct Settler pauser. |
+| `DISPLAY_IDENTITY` | address | always | Expected `owner()` on Factory and Settlers; display-only. |
+| `GOVERNANCE_SIGNER` | address | always | Public Ledger-bound Safe owner; expected to hold no direct protocol or timelock role. |
+| `DEPLOYER` | address | always | Exact public Ledger-bound sender (`0x72D3Dfc7855691d69FBf79d2e510D40d662AAE1E` on Arbitrum One); expected to hold no terminal role or ownership. |
+| `BOOTSTRAP` | address | always | One-shot bootstrap created by the canonical bootstrap-deployer with the fixed CREATE2 salt and exact config-hash/deployer-bound initcode; must have the exact `RolloverDeploymentBootstrap` runtime, report `finalized() == true`, have zero owner, expose its constructor-set config hash and nonzero write-once reviewed deployment-initcode commitment, and record the verified Factory runtime hash. |
+| `DEPLOYMENT_NONCE` | uint256 | always | Original Ledger sender nonce used to derive the canonical bootstrap-deployer; the verifier then derives the bootstrap from its fixed salt and exact initcode. |
+| `BOOTSTRAP_CONFIG_HASH` | bytes32 | always | Write-once `CONFIG_HASH()` expected from the canonical deterministic bootstrap. |
+| `EXPECTED_IMPL` | address | always | RolloverContract implementation address baked into the factory. |
+| `ROLLOVER_CONTRACT` | address | when verifying a specific cPT holder rolloverContract | `rolloverContractOf[cptHolder]` view on the factory. |
+| `EXPECTED_CPT_HOLDER` | address | when `ROLLOVER_CONTRACT` is set | cPT holder EOA that called `deployRolloverContract()`. |
+| `SRC_POOL_ID` / `DST_POOL_ID` | bytes32 | when verifying Phoenix selector | Phoenix `MarketId`. |
+| `SRC_CST_TOKEN` / `DST_CST_TOKEN` | address | when pool ids set | CST share-token addresses. |
+| `HOOK_TARGETS` | address[] (comma) | when verifying hook attestations | cPT holder's intended hook chain. |
+| `HOOK_MODULE_TYPES` | uint256[] (comma) | parallel to `HOOK_TARGETS` | `Typehashes.MODULE_TYPE_*`. |
+| `M01_FRESH_SETTLERS` | bool | always | Must be `true`: both concrete Settlers are fresh deployments. |
+| `M01_FRESH_FACTORY` | bool | always | Must be `true`: the Factory is a fresh deployment. |
+| `M01_FRESH_ROLLOVER_CONTRACTS` | bool | always | Must be `true`: verified RolloverContracts are fresh clones from the fresh Factory. |
+| `M01_PROXY_OR_IN_PLACE_REUSE` | bool | always | Must be `false`: no proxy or in-place reuse of populated legacy storage. |
+| `M01_LIVE_STATE_MIGRATION_SPEC` | bool | always | Must be `false` for this release: live-state migration is out of scope. |
+| `FILL_EXACT_SETTLER` | address | gate 5 | Must equal the same `EXACT_SETTLER` whose Factory approval and authority shape passed gates 0-4; a separate fill-only Settler is rejected. |
+| `FILL_FILLER` / `FILL_UNAUTHORIZED_FILLER` | address | gate 5 | Canonical funded/approved filler and a distinct negative-control caller. |
+| `FILL_RECIPIENT` / `FILL_PREMIUM_RECIPIENT` | address | gate 5 | Expected destination-asset and premium recipients. |
+| `FILL_SOURCE_TOKEN` / `FILL_DESTINATION_TOKEN` / `FILL_PREMIUM_TOKEN` | address | gate 5 | Real local token contracts used by the signed order. |
+| `FILL_ORDER_ID` | bytes32 | gate 5 | Canonical order digest. |
+| `FILL_ORIGIN_DATA` / `FILL_FILLER_DATA` | bytes | gate 5 | Public signed ERC-7683 order payload and atomic filler envelope; never a private key. |
+| `FILL_EXPECTED_SOURCE_DEBIT` / `FILL_EXPECTED_DESTINATION_CREDIT` | uint256 | gate 5 | Exact source-filler debit and destination-recipient credit. |
+| `FILL_EXPECTED_PREMIUM_DEBIT` / `FILL_EXPECTED_PREMIUM_RECIPIENT_CREDIT` | uint256 | gate 5 | Exact premium accounting deltas. |
+| `FILL_PREMIUM_CAP` | uint256 | gate 5 | Signed cap; the gate proves the unused remainder stays with the filler. |
+
+### Gates
+
+| # | Name | Finding discharged | What it staticcalls |
+|---|---|---|---|
+| 0 | Greenfield readiness | M-01 | No chain reads. Requires `M01_FRESH_SETTLERS=true`, `M01_FRESH_FACTORY=true`, `M01_FRESH_ROLLOVER_CONTRACTS=true`, `M01_PROXY_OR_IN_PLACE_REUSE=false`, and `M01_LIVE_STATE_MIGRATION_SPEC=false`. |
+| 1 | Factory and authority shape | F-D2 | Pairwise-distinct nonzero campaign authorities; bootstrap address derived from deployer/nonce; code-bearing finalized config-bound bootstrap with zero owner whose `deployedCodehash(FACTORY)` equals the verified Factory runtime hash; Factory implementation/registry/defaults; both approved Settlers; exact `3600` timelock delay; canonical Factory and M1 timelock roles; no open/alternate callers or pending delay update; delayed Factory/Settler roles held only by the timelock; M2 revoker; pause-only signer; M1 unpauser; display-only ownership; and terminal-zero deployer/bootstrap roles. |
+| 2 | RolloverContract shape | F-D5 | `rolloverContractConfig(rolloverContract)` — owner, registry mirror, attester parity; pending-trust quiescence via `factory.pendingTrustConfig(rolloverContract) == (0, [], 0)`. |
+| 3 | Phoenix selector | F-D3 | `IPoolShare.poolId`, `IPoolShare.poolManager`, `IPoolManager.shares`. |
+| 4 | Attestation reachability | F-D4 (HIGH) | `IERC7484.check(target, moduleType)` per hook target with `msg.sender == rolloverContract`. |
+| 5 | End-to-end fill (opt-in) | F-D8 (HIGH) | Requires `FILL_EXACT_SETTLER == EXACT_SETTLER`, proves the configured unauthorized caller cannot use the signed payload, executes the atomic `ExactSettler.fill(...)` locally, and checks exact source debit, destination credit, premium debit/credit, and premium-cap remainder preservation. |
+
+### Exit codes
+
+- `0` — every configured gate passed; `VerifyDeploy__AllGatesPassed` event
+  emitted. Release-ready.
+- Non-zero — at least one gate reverted. The revert selector names the
+  failing gate; map to the failure-mode table in §10.
+
+## 5. Domain-by-domain detail
+
+### 5.1 Phoenix-side
+
+#### Pool publication and `shares(MarketId)` selector
+
+Each `(src, dst)` CST pair the rolloverContract will roll between MUST be live in the
+Phoenix pool registry and resolvable from the CST token surface
+(`IPoolShare(token).poolManager()`, `IPoolShare(token).poolId()`, and
+`IPoolManager(pm).shares(poolId)`). The rolloverContract's `_siblingCptToken` uses
+this getter on every rollover leg to derive the sibling CPT (principal
+token) — there is no fallback selector. A phoenix build that lacks the
+`shares` view, or returns a zero principal token, reverts the rolloverContract's
+staticcall with `CorkRolloverContract__PoolManagerCallFailed(IPoolManager.shares.selector, ...)`.
+
+Gate 3 of `verify-deploy.s.sol` enforces this against the live phoenix
+bytecode before the genesis fill is broadcast.
+
+
+#### Phoenix dependency policy (M-04)
+
+M-04 is remediated as a deployment-policy dependency check, not as a Cork
+runtime manager-pinning change. Cork relies on Phoenix `PoolShare.poolManager`
+immutability (PoolShare.poolManager immutability): the CST/CPT share token's
+manager is fixed when the share token is deployed, and Gate 3 verifies the
+live `poolManager()` plus `IPoolManager.shares(poolId)` selector before release.
+
+Cork also relies on Phoenix upgrade governance for the UUPS-upgradeable
+`CorkPoolManager`. A Phoenix manager upgrade that changes `deposit` /
+`previewDeposit` collateral accounting, share minting, pool lookup, or
+share-token authority is a dependency change and MUST be reviewed before
+Rollover uses the affected markets.
+
+Phoenix collateral used by Rollover MUST be standard no-fee ERC-20
+collateral. Unsupported collateral includes fee-on-transfer, rebasing,
+deflationary, or otherwise balance-mutating behavior unless separately reviewed
+and approved for the specific Phoenix market and Rollover flow. This policy is
+the M-04 remediation boundary: no Cork runtime manager-pinning change is included.
+
+### 5.2 ERC-7484 attester registry
+
+#### Default-attester seed at `initialize`
+
+`CorkRolloverContractFactory.deployRolloverContract()` calls `ICorkRolloverContract(rolloverContract).initialize(...)`,
+which mirrors `(threshold, attesters)` into the rolloverContract's `liveTrust*` slots
+AND calls `IERC7484(registry).trustAttesters(threshold, attesters)` against
+the rolloverContract's own address. This seeds the rolloverContract's smart-account record
+inside the Rhinestone registry. If the registry call reverts (wrong address,
+ABI drift, paused), `initialize` reverts and `deployRolloverContract()` reverts
+atomically — the failure is loud at construction time. There is no Cork-side
+registry bypass or cached-success fallback: hook execution is fail-closed when
+the registry cannot validate a required module attestation.
+
+#### Attestation publication MUST precede first fill
+
+The `trustAttesters` seed call is necessary but NOT sufficient. It does NOT
+verify any attester has published any attestation, does NOT verify any
+hook-target module is attested for the four module-type buckets
+(`MODULE_TYPE_PRE_ROLLOVER_HOOK`, `MID`, `POST`, `EXECUTOR`), and does NOT
+verify the threshold is satisfiable. Gate 4 of `verify-deploy.s.sol` is the
+only end-to-end check that proves the attester→hook→bucket composition is
+satisfiable for the rolloverContract's seeded smart-account record.
+
+#### Delegatecall hook deployment policy (M-03)
+
+The rolloverContract executes hook targets with `delegatecall`, so delegatecall hooks
+are privileged trusted modules by design. Attestation is an authorization
+boundary, not a bytecode sandbox: module code runs in the rolloverContract storage frame.
+
+Production attestations MUST be limited to immutable, reviewed, storage-safe hook modules.
+Their bytecode and storage behavior must be reviewed against the rolloverContract storage
+layout. By default, upgradeable/proxy hook targets are disallowed unless the risk
+owner records explicit risk acceptance before attestation and release.
+
+### 5.3 Cork factory allowlist
+
+#### `approveSettler` is the first-order-flow gate
+
+`CorkRolloverContractFactory.executeIntentHooks` checks
+`approvedSettlers[msg.sender]` on every dispatch. The check fires on every
+fill. `deployRolloverContract()` does NOT auto-approve any Settler — the admin MUST
+call `factory.approveSettler(canonicalSettler)` for every Settler that will
+dispatch `executeIntentHooks` BEFORE the first order can flow. The approved
+address must already have deployed bytecode; EOAs and self-destructed
+addresses are rejected. The factory does not verify a Settler interface, so the
+operator must approve the canonical deployed Settler contracts. Repeating an
+approval is idempotent and still emits `SettlerApproved`.
+
+#### Atomic Settler migration is a MUST
+
+A v1 → v2 Settler migration MUST land in a single admin transaction:
+`approveSettler(v2); revokeSettler(v1)` in one Safe / multisig batch. A
+two-tx migration leaves a gap window in which in-flight orders may route
+through either Settler depending on tx interleaving; fillers in the mempool
+during that window hit `SettlerNotApproved` on v1.
+
+Safe (Gnosis Safe) tx-builder JSON example for an atomic migration:
+
+```json
+{
+  "version": "1.0",
+  "chainId": "1",
+  "createdAt": 1779000000000,
+  "meta": { "name": "Cork Settler v1->v2 atomic migration" },
+  "transactions": [
+    {
+      "to": "<factory>",
+      "value": "0",
+      "data": "0x<encoded approveSettler(v2)>",
+      "contractMethod": {
+        "name": "approveSettler",
+        "inputs": [{ "name": "settler", "type": "address" }],
+        "payable": false
+      },
+      "contractInputsValues": { "settler": "<v2-settler>" }
+    },
+    {
+      "to": "<factory>",
+      "value": "0",
+      "data": "0x<encoded revokeSettler(v1)>",
+      "contractMethod": {
+        "name": "revokeSettler",
+        "inputs": [{ "name": "settler", "type": "address" }],
+        "payable": false
+      },
+      "contractInputsValues": { "settler": "<v1-settler>" }
+    }
+  ]
+}
+```
+
+Discharges F-D7.
+
+## 6. cPT holder onboarding
+
+The deployment model is **cPT holder**: the cPT holder holds the
+CWIA `owner` slot and is the sole intent-signing key.
+
+### `deployRolloverContract()`
+
+The cPT holder (an EOA or multisig) calls `factory.deployRolloverContract()`. The factory:
+
+1. Reverts if `rolloverContractOf[owner] != address(0)` (one rolloverContract per cPT holder per
+   factory deployment).
+2. Clones `ROLLOVER_CONTRACT_IMPLEMENTATION` via OZ
+   `Clones.cloneDeterministicWithImmutableArgs` with a domain-separated
+   owner salt and a 60-byte trailer encoding `owner ‖ factory ‖ erc7484Registry`.
+3. Invokes the clone's `initialize(DEFAULT_TRUST_THRESHOLD, _defaultAttesters)`
+   atomically inside the same transaction. The clone reads its ERC-7484
+   registry from the CWIA trailer rather than as an `initialize` argument.
+
+`factory.predictRolloverContractOf(owner)` returns the same address before
+deployment. Cross-chain same-address parity is not based on `chainid`; it
+requires the same CREATE2 deployer/factory address, rolloverContract
+implementation address, owner, and live ERC-7484 registry address.
+
+### Atomic `initialize` seed
+
+`CorkRolloverContract.initialize` mirrors the factory defaults into the rolloverContract's
+`liveTrust*` slots AND forwards them to `IERC7484.trustAttesters`. The
+rolloverContract's smart-account record inside the registry starts seeded out-of-the-box;
+the cPT holder does NOT need to call `factory.queueTrustConfig(...)` for the
+first dispatch to succeed.
+
+### First-order readiness checklist
+
+Before the cPT holder signs the genesis intent, every gate in `script/verify-deploy.s.sol`
+MUST exit 0 against the target chain. Specifically:
+
+- Gate 1 — factory allowlist includes both ExactSettler and PartialSettler.
+- Gate 2 — `factory.pendingTrustConfig(rolloverContract) == (0, [], 0)`.
+- Gate 3 — Phoenix `shares(MarketId)` resolves for every pool the cPT holder intends
+  to roll between.
+- Gate 4 — every hook target is attested for its bucket against the rolloverContract's
+  seeded smart-account record. RolloverContracts that intend to support **cross-CA
+  rollover** (src and dst pools backed by different collateral assets — e.g.
+  USDC and DAI) MUST additionally have a reference SwapModule deployed and
+  attested under `MODULE_TYPE_MID_ROLLOVER_HOOK`. The SwapModule is a
+  delegatecall hook the cPT holder signs into `midRolloverHooks` to swap caSrc → caDst
+  between `unwindMint` and `deposit`; end-to-end value is bounded by the
+  cPT-holder-signed `params.minSharesOut` floor (`INV-DST-FLOOR`). Same-CA rolloverContracts
+  do not require a mid-hook attestation. Reference SwapModule implementations
+  are out of scope for this contract release; Cork ops attests cPT-holder-supplied
+  modules under standard ERC-7484 attestation flow.
+
+## 7. Optional cPT holder trust-config update
+
+A cPT holder that wants to update their own deployed rolloverContract's trust config uses the
+external per-rolloverContract trust-config `TimelockController` path. Owner-side queue and
+cancel entrypoints derive the rolloverContract from `rolloverContractOf[msg.sender]`; permissionless
+apply and filler/keeper views still take an explicit `rolloverContract`. There are two
+queue entrypoints and both share the same delay / cancel / apply lifecycle:
+
+- Safe/default path:
+  `factory.queueFactoryDefaultTrustConfig()` — cPT holder (rolloverContract `owner`) only.
+  Snapshots the factory's current live `DEFAULT_TRUST_THRESHOLD()` and
+  `defaultAttesters()` at queue time, then schedules those values. This is not
+  automatic following of future defaults; if `setDefaults` changes later, the
+  queued config remains the earlier snapshot and the cPT holder must queue again to use
+  newer defaults.
+- Advanced/custom path:
+  `factory.queueTrustConfig(threshold, attesters)` — cPT holder (rolloverContract
+  `owner`) only. Schedules caller-supplied values after validating the complete
+  replacement config.
+- Both queue paths schedule a timelock op with the trust-config timelock's
+  current configured delay and mirror `(salt, threshold,
+  attesters)` into the factory's `pendingConfig[salt]` / `lastSalt[rolloverContract]`
+  state. Re-queueing by either path cancels any prior pending op for this rolloverContract
+  and resets the trust-config timelock clock. If an extra proposer pre-scheduled
+  the exact factory operation, the factory cancels it before scheduling the
+  owner queue so the delay starts from the owner queue transaction.
+- `factory.applyTrustConfig(rolloverContract)` —
+  **permissionless** once the timelock delay elapses. Loads `(threshold,
+  attesters)` and the queued salt from the factory mirror, sets the exact
+  expected operation id for this execution frame, then routes through
+  `relayTrustConfig(rolloverContract, salt, threshold, attesters)` →
+  `ICorkRolloverContract.setTrustConfig`. Direct timelock execution and stale or
+  malicious raw timelock operations fail closed because the relay requires the
+  pending salt and the apply-frame op id.
+- **Owner-side abort:** `factory.cancelTrustConfig()` — cPT holder only.
+  Cancels the pending timelock op for the caller's own rolloverContract and clears the
+  factory mirror in a single tx.
+
+### First fill follows first apply
+
+The trust-config timelock address is immutable. The protocol source supports a
+bounded Factory-governed delay-update path, but this campaign fixes the live
+delay at exactly 3,600 seconds. A queued delay update, a shorter delay, or a
+longer delay blocks Gate 1. Each trust-config operation must therefore complete
+the full one-hour schedule/delay/execute path before apply and before the next
+release check. cPT holders that queue and apply a trust-config change near their
+first fill can race their own fillers if they do not observe that window.
+
+`factory.pendingTrustConfig(rolloverContract)` is intentionally a Factory mirror plus
+timelock timestamp view:
+
+- `threshold` / `attesters` are the Factory-mirrored pending trust config.
+- `effectiveAt` is `trustConfigTimelock.getTimestamp(opId)` for the mirrored
+  operation.
+- `(0, [], 0)` means no Factory pending mirror exists.
+- `(nonzero config, effectiveAt > 0)` means a Factory pending mirror exists and
+  the corresponding timelock op exists.
+- `(nonzero config, effectiveAt == 0)` means the Factory pending mirror exists
+  but the timelock op is absent, done, or unset. This is mirror/timelock
+  divergence, usually from direct external timelock cancellation. The owner
+  should call `factory.cancelTrustConfig()` or requeue to recover.
+
+**Gate 2 acceptance criterion:** `factory.pendingTrustConfig(rolloverContract) == (0, [], 0)`.
+`effectiveAt == 0` alone is not sufficient, and `block.timestamp >= effectiveAt + 60s`
+is not sufficient while the queued config remains unapplied.
+
+Gate 2 proves no pending Factory mirror exists. It does not prove historical
+observation time after a recently applied trust-config change. If a trust-config
+change was recently applied, operators should inspect live `getMinDelay()`: wait
+that window when nonzero, then rerun verification; when it is zero, no nonzero
+observation window exists. F-D5 discharged.
+
+## 8. Kill-switch matrix
+
+| Lever | Mechanism | Latency | Role required |
+|---|---|---|---|
+| `factory.revokeSettler(settler)` | Removes a Settler from the allowlist; the next factory dispatch from that Settler fails before rolloverContract execution. | Instant. | `SETTLER_REVOKER_ROLE` on factory. |
+| `settler.pause()` / `unpause()` | OZ Pausable; all state-changing entrypoints reject when paused. | Instant. | `PAUSER_ROLE` / `UNPAUSER_ROLE` on Settler (split). |
+| `factory.queueFactoryDefaultTrustConfig()` / `factory.queueTrustConfig(...)` | Stages an attester-set change for the caller's own deployed rolloverContract on the external per-rolloverContract trust-config `TimelockController` behind its configured delay. The default path snapshots current factory defaults at queue time; the custom path uses caller-supplied values. | Trust-config timelock `minDelay`. | RolloverContract `owner` (the cPT holder). |
+
+**DO NOT** confuse these:
+
+- `revokeSettler` is the only Cork-side lever that immediately severs the
+  dispatch surface for ALL rolloverContracts deployed by this factory.
+- `pause()` / `unpause()` is Settler-scoped, not factory-scoped — pausing
+  Settler v1 does NOT pause Settler v2 even when both are approved.
+- Factory trust-config queueing is per-rolloverContract; one rolloverContract's queue does not
+  affect another rolloverContract's live attesters.
+
+## 9. Version migration
+
+### Settler v1 → v2 (atomic)
+
+`approveSettler(v2); revokeSettler(v1)` in a single admin tx — see the Safe
+tx-builder JSON example in §5.3. Mandatory; two-tx migration leaks the
+in-flight order window.
+
+### PR #66 ABI break checklist
+
+Split-settler deployments are a hard ABI break for downstream fillers and
+operators:
+
+- `fillerData` has one accepted shape: the canonical 10-field payload
+  `(phase, fillAmount, premium, destination, premiumFor, intent, minDstPerSrc,
+  fillerAuthSig, subFiller, cptHolderSig)`. The legacy payload shape
+  without `premiumFor` is rejected by `LibFillerAuth.decodePayload`.
+- PREMIUM payloads must set `premiumFor` to the recorded rollover filler.
+  ROLLOVER payloads must set `premiumFor` to zero.
+- `BaseFiller` / `EvcRolloverAdapter` deployments now wire both
+  `EXACT_SETTLER` and `PARTIAL_SETTLER`; downstream constructor arguments and
+  deployment scripts must be updated accordingly.
+- Release gates must verify both settlers are approved on the factory. A
+  deployment that only configures the former single `SETTLER` /
+  `CANONICAL_SETTLER` address is incomplete.
+
+### Factory v1 → v2 (new deployment)
+
+Each `CorkRolloverContractFactory` deployment binds one immutable
+`ROLLOVER_CONTRACT_IMPLEMENTATION`. A new rolloverContract version ships as a new factory
+deployment. The cPT holder redeploys their rolloverContract through factory v2 under the same
+EOA and receives a fresh `rolloverContractOf[cptHolder]` slot in v2; the v1 binding remains
+in place as legacy state. Off-chain infrastructure resolves the active
+rolloverContract by querying the version-of-record factory address.
+
+### cPT holder key compromise
+
+cPT holder key compromise inside a single factory is **irrecoverable on-chain**:
+`rolloverContractOf[cptHolder]` has no admin reset path, and the compromised EOA can sign
+valid intents against its own legacy rolloverContract indefinitely. Mitigations:
+
+- Factory revoker calls `revokeSettler(compromisedSettler)` against every
+  Settler the compromised key has authorised; the factory is default-deny,
+  so revocation is instant and any future re-approval is a separate approver
+  action.
+- cPT holder redeploys under a fresh EOA against the next rolloverContract-version factory
+  (only possible when a new factory is released).
+- Accept the burn — the compromised rolloverContract's funds-routing decisions remain
+  under attacker control; the rest of the protocol is unaffected.
+
+Operators planning long-lived deployments should treat the rolloverContract binding
+as scoped to factory-version cadence, NOT to the cPT holder EOA's operational
+lifetime.
+
+## 10. Failure-mode table
+
+Indexed by the first revert selector an operator will see during a botched
+deployment. Every Cork-specific selector here (the `CorkRolloverContract*` and
+`CorkRolloverContractFactory*` ones) is greppable in `src/`; the `VerifyDeploy__*`
+selectors live in `script/verify-deploy.s.sol`, and `TimelockController.*` /
+`EnforcedPause` are OpenZeppelin selectors.
+
+| Selector | Root cause | Recovery |
+|---|---|---|
+| `CorkRolloverContractFactory__SettlerNotApproved(addr)` | Genesis Settler approval missing. | Approve both ExactSettler and PartialSettler from factory admin. |
+| `CorkRolloverContractFactory__AddressHasNoCode(addr)` | Attempted to use an EOA or undeployed contract where Factory expects code. | Deploy the target contract first, then retry. |
+| `CorkRolloverContractFactory__UnknownRolloverContract(addr)` | RolloverContract address typed wrong, or wrong factory. | Read `rolloverContractOf[cptHolder]` from the correct factory. |
+| `CorkRolloverContractFactory__PhaseNotDispatchable(uint8)` | Settler sent a phase other than ROLLOVER / PREMIUM. | Settler bug — not a deploy issue; escalate. |
+| `CorkRolloverContract__SettlerMismatch` | Factory's `originatingSettler()` doesn't match `ctx.originSettler`. | Latch poisoning from an unexpected settler; escalate. |
+| `CorkRolloverContract__SignedSettlerOriginMismatch(s, o)` | Signed `orderData.rolloverParams.settler != ctx.originSettler` (INV-PARAMS-SETTLER-PIN). | Settler-side payload-build bug or stale signed order. |
+| `CorkRolloverContract__ModuleTypeMismatch(target, mt)` | Hook target not attested for the bucket the rolloverContract is calling. | Attester publishes attestation; or cPT holder signs a different hook chain. |
+| `CorkRolloverContract__PoolManagerCallFailed(selector, data)` | `selector == shares.selector` → Phoenix `shares(MarketId)` not available or returns zero principal. | Verify phoenix build; verify pool published; verify CST→pool binding. |
+| `CorkRolloverContract__SrcPoolIdMismatch` / `DstPoolIdMismatch` | cPT-holder-signed `srcPoolId`/`dstPoolId` doesn't match `IPoolShare(token).poolId()`. | cPT holder re-signs with correct pool IDs. |
+| `CorkRolloverContract__BadIntentSignature` | Intent signed by non-owner, or owner rotated mid-flight without ERC-1271 cover. | cPT holder re-signs. |
+| `TimelockController.TimelockUnexpectedOperationState` | `factory.applyTrustConfig` called before the external trust-config timelock delay elapsed. | Wait. |
+| `CorkRolloverContractFactory__NoQueuedTrustConfig(rolloverContract)` | `factory.applyTrustConfig` / `cancelTrustConfig` called for a rolloverContract with no pending queue. | No-op or re-queue. |
+| `CorkRolloverContractFactory__MismatchedApplyArgs(expectedSalt)` | Relay calldata/salt does not match the factory pending mirror, a stale/malicious/direct timelock callback was attempted, or the factory/timelock operation identity diverged. | Re-read `factory.pendingTrustConfig(rolloverContract)` and use canonical `factory.applyTrustConfig(rolloverContract)`. If mirror/timelock state diverged because an external canceller unset the op, the owner should call `factory.cancelTrustConfig()` or requeue. |
+| `EnforcedPause` (OZ Pausable) | Settler paused. | Unpauser action; not a deploy issue. |
+| `VerifyDeploy__FactoryShapeMismatch(field, ...)` | Gate 1 found a factory-state divergence. | Re-check factory deployment receipts vs operator inputs. |
+| `VerifyDeploy__SettlerAuthorityCollapsed(ensOwner, admin, pauser, unpauser)` | Gate 1 received a collapsed authority shape. | Restore the exact display identity / timelock admin / pause signer / M1 unpause split. |
+| `VerifyDeploy__SettlerAuthorityMismatch(settler, field, ...)` | Gate 1 found a missing expected Settler role or a forbidden extra role. | Reconcile the Settler with the exact campaign authority graph; do not add an alias or bypass. |
+| `VerifyDeploy__RolloverContractShapeMismatch("pendingTrustConfig", ...)` | Gate 2 found a pending or divergent trust-config Factory mirror. The verifier requires `factory.pendingTrustConfig(rolloverContract) == (0, [], 0)`; nonzero threshold/attesters with `effectiveAt == 0` means mirror/timelock divergence. | Apply an intentional ready queue only after its 3,600-second delay, then rerun verification. If divergent/stale, the owner cancels or requeues through the canonical Factory path. |
+| `VerifyDeploy__RolloverContractShapeMismatch(field, ...)` | Gate 2 found another rolloverContract-state divergence. | Re-check cPT holder, registry mirror, and live attester parity against deployment inputs. |
+| `VerifyDeploy__PhoenixSelectorUnavailable(selector, data)` | Gate 3 — `shares(MarketId)` reverted or returned zero principal. | Phoenix admin publishes / re-binds the pool. |
+| `VerifyDeploy__AttestationMissing(target, moduleType)` | Gate 4 — registry rejected `(rolloverContract, target, moduleType)`. | Attester publishes the missing attestation. |
+| `VerifyDeploy__FillSimulationFailed(reason)` | Gate 5 rejected incomplete inputs, accepted the negative-control caller, observed a wrong balance delta, or failed the real atomic fill. | Fix the public `FILL_*` payload/expectations or the deployed address/role wiring, then rerun the local simulation. |
+
+## 11. Glossary disambiguation
+
+- **"Attester."** ERC-7484 attesters (the addresses in `liveTrustAttesters`)
+  — NOT the EIP-712 signers on intents (the cPT holder owner). The factory's
+  `defaultAttesters()` seeds the rolloverContract's smart-account record at
+  `initialize`. The rolloverContract checks the cPT-holder signature over `orderDigest`
+  against `owner()` on every hook dispatch.
+- **"Settler."** The Cork `Settler` contract (the ERC-7683-shaped origin /
+  destination settler) — NOT an OZ Pauseable role-holder. The factory's
+  `approvedSettlers` allowlist refers to contract addresses, not EOAs.
+- **"Pool."** Phoenix `MarketId` (the bytes32) — NOT the CST share token
+  (the ERC-20). `IPoolShare(token).poolId()` is the bridge from CST→MarketId.
+
+## 12. Appendix — ABI and events
+
+### `RolloverIntent` (8 fields)
+
+```
+struct RolloverIntent {
+    address rolloverContract;
+    bytes32 orderDigest;
+    uint64  deadline;
+    uint64  nonce;
+    Call[]  preRolloverHooks;
+    Call[]  midRolloverHooks;
+    Call[]  postRolloverHooks;
+    Call[]  premiumHooks;
+}
+```
+
+### `RolloverParams` (7 fields)
+
+```
+struct RolloverParams {
+    address srcCstToken;
+    address dstCstToken;
+    uint256 minCaReceived;
+    uint256 minSharesOut;
+    bytes32 srcPoolId;
+    bytes32 dstPoolId;
+    address settler;
+}
+```
+
+`HookPhase` enum is `{ROLLOVER, PREMIUM}` — no migration shim is shipped.
+
+### Critical events
+
+- `CorkRolloverContractFactory.SettlerApproved(settler)` / `SettlerRevoked(settler)`
+  — allowlist transitions; gate 1 cares.
+- `CorkRolloverContractFactory.TrustConfigQueued(rolloverContract, opId, threshold, attesters, effectiveAt)` /
+  `TrustConfigApplied(rolloverContract, opId, threshold, attesters)` — trust-config window
+  transitions; gate 2 cares.
+- `VerifyDeploy.VerifyDeploy__AllGatesPassed(factory, rolloverContract, fillSimulationRan)`
+  — emitted by the release script when every configured gate has passed.

@@ -1,0 +1,155 @@
+%%{init: {"theme": "default", "themeVariables": {"fontSize": "14px"}}}%%
+flowchart TD
+
+  %% ===== Fillers (orchestration entry) =====
+  subgraph FILLERS["Fillers (orchestration entry)"]
+    BaseFiller["BaseFiller.sol"]
+    EvcAdapter["EvcRolloverAdapter.sol<br/>(adapter context only; OOS)"]
+  end
+
+  %% ===== Settler (ERC-7683 origin) =====
+  Settler["ExactSettler.sol and PartialSettler.sol"]
+
+  %% ===== Factory + RolloverContract =====
+  subgraph ROLLOVER_CONTRACT["RolloverContract Layer"]
+    Factory["CorkRolloverContractFactory.sol"]
+    RolloverContract["CorkRolloverContract.sol"]
+  end
+
+  %% ===== Shared types =====
+  RolloverTypes["RolloverTypes.sol"]
+
+  %% ===== Libraries =====
+  subgraph LIBS["Libraries"]
+    LibSettlerHashing["LibSettlerHashing.sol"]
+    LibAuthHooks["LibAuthenticatedHooks.sol"]
+    LibRolloverOrder["LibRolloverOrder.sol"]
+    LibHookPhase["LibHookPhase.sol"]
+    LibFillerAuth["LibFillerAuth.sol"]
+    Typehashes["Typehashes.sol"]
+  end
+
+  %% ===== Hook modules (delegatecall only) =====
+  subgraph MODULES["Hook Modules (OnlyDelegatecall guard)"]
+    OnlyDelegate["OnlyDelegatecall.sol"]
+    Approve["ApproveModule.sol"]
+    ScopedSplit["ScopedSplitModule.sol"]
+    ScopedTransfer["ScopedTransferModule.sol"]
+    PreRef["PreRolloverReferenceModule.sol"]
+    MidRef["MidRolloverReferenceModule.sol"]
+    PostRef["PostRolloverReferenceModule.sol"]
+  end
+
+  %% ===== Interfaces / external surfaces =====
+  subgraph INT["Internal Interfaces"]
+    ISettler[/"ISettler / IBaseSettler"/]
+    IRolloverContract[/"ICorkRolloverContract"/]
+    IFactory[/"ICorkRolloverContractFactory"/]
+    ILens[/"IRolloverContractLens"/]
+    IERC7484s[/"IERC7484"/]
+  end
+
+  subgraph EXT["External Interfaces / OZ"]
+    IPoolMgr[("IPoolManager (Phoenix)")]
+    IPoolShare[("IPoolShare (Phoenix)")]
+    IERC7484x[("ERC-7484 (Rhinestone)")]
+    IEVC[("IEVC")]
+    IOriginSettler[("IOriginSettler (ERC-7683)")]
+    OZ_Access[("OZ AccessControl + Ownable2Step + Pausable + EIP712")]
+    OZ_Init[("OZ Initializable + ReentrancyGuardTransient + Clones")]
+    OZ_SafeERC20[("OZ SafeERC20 + Math + SignatureChecker")]
+  end
+
+  %% ===== Filler → Settler =====
+  BaseFiller --> Settler
+  %% EvcRolloverAdapter is adapter/integration context only and out of audit scope
+  %% unless explicitly re-added in SCOPE.md.
+  EvcAdapter -.->|"adapter context"| Settler
+  EvcAdapter ...> IEVC
+
+  %% ===== Filler imports =====
+  BaseFiller --> RolloverTypes
+  BaseFiller --> LibRolloverOrder
+  BaseFiller --> LibSettlerHashing
+  BaseFiller --> ISettler
+  BaseFiller --> OZ_SafeERC20
+  BaseFiller -.-> OZ_Init
+
+  EvcAdapter --> RolloverTypes
+  EvcAdapter --> ISettler
+  EvcAdapter --> OZ_SafeERC20
+  EvcAdapter -.-> OZ_Init
+
+  %% ===== Settler imports / inherits =====
+  Settler --> RolloverTypes
+  Settler --> Factory
+  Settler --> LibSettlerHashing
+  Settler --> LibRolloverOrder
+  Settler --> LibHookPhase
+  Settler --> LibFillerAuth
+  Settler --> Typehashes
+  Settler --> ISettler
+  Settler --> IFactory
+  Settler ...> IPoolShare
+  Settler ...> IOriginSettler
+  Settler --> OZ_SafeERC20
+  Settler -.-> OZ_Access
+  Settler -.-> OZ_Init
+
+  %% ===== Factory =====
+  Factory --> RolloverTypes
+  Factory --> IRolloverContract
+  Factory --> IFactory
+  Factory --> ILens
+  Factory -.-> OZ_Access
+  Factory -.-> OZ_Init
+
+  %% ===== RolloverContract =====
+  RolloverContract --> RolloverTypes
+  RolloverContract --> LibAuthHooks
+  RolloverContract --> Typehashes
+  RolloverContract --> IRolloverContract
+  RolloverContract --> IFactory
+  RolloverContract --> IERC7484s
+  RolloverContract ...> IERC7484x
+  RolloverContract ...> IPoolShare
+  RolloverContract ...> IPoolMgr
+  RolloverContract -.-> OZ_Init
+  RolloverContract --> OZ_SafeERC20
+  RolloverContract ==> MODULES
+
+  %% ===== Libraries internal =====
+  LibSettlerHashing --> RolloverTypes
+  LibSettlerHashing --> Typehashes
+  LibAuthHooks --> RolloverTypes
+  LibAuthHooks --> Typehashes
+  LibRolloverOrder --> RolloverTypes
+  LibHookPhase --> RolloverTypes
+  LibFillerAuth --> Typehashes
+  Typehashes ...> IERC7484x
+
+  %% ===== Modules internal =====
+  Approve --> OnlyDelegate
+  Split --> OnlyDelegate
+  ScopedSplit --> OnlyDelegate
+  ScopedTransfer --> OnlyDelegate
+  PreRef --> OnlyDelegate
+  MidRef --> OnlyDelegate
+  PostRef --> OnlyDelegate
+  Approve --> OZ_SafeERC20
+  Split --> OZ_SafeERC20
+  ScopedSplit --> OZ_SafeERC20
+  ScopedTransfer --> OZ_SafeERC20
+
+  %% ===== Styling =====
+  classDef critical fill:#fff1f0,stroke:#c4181f,stroke-width:2px;
+  classDef hub fill:#f0f8ff,stroke:#1565c0,stroke-width:2px;
+  classDef leaf fill:#f9f9f9,stroke:#999;
+  classDef external fill:#fff8e1,stroke:#f9a825,stroke-dasharray: 4 2;
+
+  class Settler,RolloverContract critical;
+  class Factory,BaseFiller,EvcAdapter hub;
+  class IPoolMgr,IPoolShare,IERC7484x,IEVC,IOriginSettler,OZ_Access,OZ_Init,OZ_SafeERC20 external;
+  class RolloverTypes,Typehashes,LibSettlerHashing,LibAuthHooks,LibRolloverOrder,LibHookPhase,LibFillerAuth leaf;
+  class OnlyDelegate,Approve,Split,ScopedSplit,ScopedTransfer,PreRef,MidRef,PostRef leaf;
+  class ISettler,IRolloverContract,IFactory,ILens,IERC7484s leaf;

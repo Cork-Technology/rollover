@@ -1,0 +1,26 @@
+sequenceDiagram
+    autonumber
+    actor U as User (cPT holder)
+    participant S as Settler
+    participant FA as Factory
+    participant PMs as IPoolShare(srcCST)
+    participant PMd as IPoolShare(dstCST)
+
+    U->>S: open(onchainOrder)
+    S->>S: require msg.sender == orderData.user
+    S->>S: require onchainOrder.fillDeadline == orderData.fillDeadline
+    S->>S: _validateOrderCommon — envelope/payload binding, timing, economics
+    S->>FA: isDeployedRolloverContract(orderData.rolloverContract) [staticcall]
+    S->>PMs: poolId(), expiry()
+    S->>PMd: poolId(), expiry()
+    S->>S: SL-14 srcPoolId != dstPoolId, pool-expiry gate
+    S->>S: orderDigest = _orderDigestMemory(orderData)
+    Note over S: No user signature check; user is msg.sender
+    alt status == Opened
+        S-->>U: idempotent no-op (no event)
+    else _blocksRollover(status)
+        S-->>U: revert Settler__OrderInTerminalState
+    else status == None
+        S->>S: orderStatus[digest] = Opened
+        S-->>U: emit: Open(digest, resolvedOrder)
+    end
