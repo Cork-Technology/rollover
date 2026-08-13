@@ -27,6 +27,9 @@ contract MockERC7484 is IERC7484 {
     /// @param previous Attester at index `i - 1`.
     /// @param current Attester at index `i` that is not greater than `previous`.
     error MockERC7484__UnsortedAttesters(address previous, address current);
+    /// @notice Reverts when an attestation uses a module-type index outside the registry bitmap.
+    /// @param moduleType Invalid module-type index.
+    error MockERC7484__InvalidModuleType(uint256 moduleType);
     /// @notice Rejected.
     /// @return rejected Stored rejected value.
 
@@ -71,7 +74,11 @@ contract MockERC7484 is IERC7484 {
     /// @param moduleType ERC-7484 module type (uint256 enum).
 
     function setAttestedType(address module, ModuleType moduleType) external {
-        _attestedType[module] = ModuleType.unwrap(moduleType);
+        uint256 value = ModuleType.unwrap(moduleType);
+        if (value > 31) {
+            revert MockERC7484__InvalidModuleType(value);
+        }
+        _attestedType[module] = value;
     }
 
     /// @notice Sets an explicit attester-specific attestation.
@@ -79,8 +86,12 @@ contract MockERC7484 is IERC7484 {
     /// @param module Module address (Rhinestone-style external module).
     /// @param moduleType ERC-7484 module type (uint256 enum).
     function setAttestedTypeFor(address attester, address module, ModuleType moduleType) external {
+        uint256 value = ModuleType.unwrap(moduleType);
+        if (value > 31) {
+            revert MockERC7484__InvalidModuleType(value);
+        }
         _explicitConfigured[module] = true;
-        _attestedTypeFor[attester][module] = ModuleType.unwrap(moduleType);
+        _attestedTypeFor[attester][module] = value;
     }
 
     /// @notice Clears an explicit attester-specific attestation.

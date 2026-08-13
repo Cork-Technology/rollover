@@ -15,8 +15,8 @@ import {
     CorkRolloverContract__RegistryZero,
     CorkRolloverContract__TooManyAttesters
 } from "src/errors/CorkRolloverContractErrors.sol";
-import { ModuleType } from "src/interfaces/external/erc7484/IERC7484.sol";
 import { ICorkRolloverContract } from "src/interfaces/rollover/ICorkRolloverContract.sol";
+import { Typehashes } from "src/libraries/Typehashes.sol";
 
 /// @notice CorkRolloverContractDefaultsInitTest — pins CorkRolloverContractDefaultsInit behaviour for the Cork Rollover suite.
 contract CorkRolloverContractDefaultsInitTest is Test {
@@ -259,13 +259,9 @@ contract CorkRolloverContractDefaultsInitTest is Test {
         address rolloverContract = _deploy();
         address module = address(0xCAFE);
 
-        erc7484.setAttestedType(module, _moduleTypeExecutor());
+        erc7484.setAttestedType(module, Typehashes.MODULE_TYPE_EXECUTOR);
 
         vm.prank(rolloverContract);
-        erc7484.check(module, _moduleTypeExecutor());
-    }
-
-    function _moduleTypeExecutor() internal pure returns (ModuleType) {
-        return ModuleType.wrap(uint256(keccak256("CorkExecutorModuleV1")));
+        erc7484.check(module, Typehashes.MODULE_TYPE_EXECUTOR);
     }
 }

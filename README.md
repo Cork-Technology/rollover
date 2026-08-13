@@ -15,9 +15,9 @@ Repository release versions are recorded in [`VERSION`](VERSION). The deployed c
 ## Source provenance
 
 - Private source repository: `Cork-Technology/rollover-private`
-- Private source commit: `76c360d9b78a28cb6ac6135734686f9858178c06`
-- Private source tree: `49ef519acd9fb49588a7232c1b0f5e9ce3202799`
-- Preserved `src/` tree: `d8b28e72492233594d0e140ccb995e30629f1601`
+- Private source commit: `5af1048eb9896582115c3615bdc5a4a9166cbbf6`
+- Private source tree: `bd257b57d2f66518e3080b11c143871725672128`
+- Preserved `src/` tree: `06b99df612148dd8faaca6af7f4e4f2e4c4f0a86`
 
 Development infrastructure, deployment scripts, operational authorization material, generated audit context, formal-verification artifacts, and private CI configuration are intentionally excluded.
 
@@ -48,7 +48,7 @@ Fork and deployment-script tests are excluded from this curated snapshot because
 
 ## Shadow deployments
 
-Release `v0.1.0-rc.1` records the paired shadow deployment on Base and Arbitrum One from the exact source provenance above. These deployments remain provisional and are not presented as production-ready.
+Release `v0.1.0-rc.2` records the paired shadow deployment on Base and Arbitrum One from the exact source provenance above. These deployments remain provisional and are not presented as production-ready.
 
 The consolidated deployment manifest is [`deployments/rollover-release-v1.json`](deployments/rollover-release-v1.json). It records all 13 canonical singleton components, paired addresses, runtime hashes, artifact digests, exclusions, and the deployment-readiness evidence digests.
 

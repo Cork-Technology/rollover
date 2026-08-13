@@ -449,6 +449,13 @@ without an inline gloss is forbidden by the lintspec strict run.
   `IERC7484.trustAttesters(threshold, attesters)` reseeds the registry from the
   rolloverContract mirror. A hook that calls `registry.trustAttesters(...)` as the rolloverContract
   cannot persist attacker attesters for later phases without detection.
+- **Registry-compatible phase buckets.** Every hook check uses one of four
+  nonzero, pairwise-distinct Cork-local indices within the deployed registry's
+  0…31 bitmap: pre `5`, mid `6`, post `7`, premium/executor `8`
+  (`Typehashes.sol:50-64`). These are not standardized ERC-7579 IDs. A module
+  attested for one bucket does not satisfy another bucket. The removed
+  `0xc0c0_0001..0xc0c0_0004` values cannot form a usable deployed-registry
+  attestation, so bytecode containing them requires greenfield redeployment.
 - **Throw site:** `CorkRolloverContractFactory.queueTrustConfig` reverts
   `CorkRolloverContractFactory__InvalidThreshold` / `CorkRolloverContractFactory__ZeroAddress` /
   `CorkRolloverContractFactory__DuplicateAttester` /
@@ -463,8 +470,16 @@ without an inline gloss is forbidden by the lintspec strict run.
   configured delay has not elapsed.
 - **Tests:** `test/unit/factory/TrustConfigQueue.t.sol` (queue / cancel /
   validation surface); `test/unit/rollover-contract/TrustConfigViaFactory.t.sol`
-  (factory-only `setTrustConfig` gate); `test/integration/timelock/EndToEnd.t.sol`
-  (queue → wait configured delay → apply path through `TimelockController`);
+  (factory-only `setTrustConfig` gate);
+  `test/unit/rollover-contract/ModuleTypeCompatibility.t.sol` (bitmap bounds,
+  nonzero/distinct allocation, wrong-bucket rejection, threshold, ordering,
+  revocation, and caller-scoped trust behavior);
+  `test/integration/rollover/HookRestructure.t.sol` (all four hook paths call
+  the expected phase bucket and reject cross-bucket attestations);
+  `test/fork/RhinestoneRegistryModuleTypesFork.t.sol` (deployed Registry
+  compatibility where an optional Base/Arbitrum RPC is configured);
+  `test/integration/timelock/EndToEnd.t.sol` (queue → wait configured delay →
+  apply path through `TimelockController`);
   `test/invariant/failOnRevert/FactoryIsSoleRolloverContractTrustWriter.t.sol`
   (no non-factory writer to live trust state);
   `test/invariant/failOnRevert/PendingTimelockMatchesFactoryMirror.t.sol`
@@ -1582,6 +1597,34 @@ outcomes remain governed by `_applyRolloverAccounting`.
   (typehash literal pins, struct-decode round-trip, NatSpec discipline,
   view-param + storage-mapping-key naming).
 
+
+### INV-JIT-MARKET-COMMITMENT
+
+- **Statement:** `BaseFiller.executeWithMarket` MUST reject any
+  `JITMarketParams` whose complete hash differs from the cPT-holder-signed
+  `RolloverParams.jitMarketHash`. The commitment includes the market fields,
+  recipe, rate override, constraint, recipe data, swap fee, and unwind fee.
+  The fee terms govern first creation only; Phoenix does not expose existing
+  pool fees through the `Market` value used for pool identity.
+- **Throw site:** `src/BaseFiller.sol::_ensureMarket` before oracle resolution
+  or pool creation.
+- **Tests:** `test/unit/filler/BaseFillerJitMarket.t.sol`,
+  `test/integration/rollover/RolloverParamsTypehash.t.sol`,
+  `test/unit/libraries/LibSettlerHashing_Pure.t.sol`.
+
+### INV-JIT-MARKET-MAX-EXPIRY
+
+- **Statement:** `BaseFiller.executeWithMarket` MUST create a missing Phoenix
+  pool only when Market Registry returns a nonzero `maxExpiryDuration` and the
+  signed market expiry is no later than `block.timestamp + maxExpiryDuration`.
+  Reverting, empty, short, or oversized registry responses fail closed. A pool
+  that already exists bypasses the current bound because governance changes
+  cannot alter that pool's immutable expiry or strand later fills into it.
+- **Throw site:** `src/BaseFiller.sol::_enforceMaxExpiryDuration`, reached from
+  `_ensureMarket` after signed JIT-hash and pool-ID validation and the
+  existing-pool check, but before the oracle-rate check and Phoenix creation.
+- **Tests:** `test/unit/filler/BaseFillerJitMarket.t.sol`.
+
 ## Settler invariants (admission)
 
 ### INV-PREMIUM-TOKEN-NONZERO
@@ -1903,6 +1946,53 @@ outcomes remain governed by `_applyRolloverAccounting`.
   (`invariant_fillerDestination_setOnceNeverZero`),
   `test/invariant/continueOnRevert/FillerDestination.t.sol`
   (loose-mode companion).
+
+### INV-DEPLOYMENT-IDENTITY-CHAIN-INVARIANT
+
+- **Statement:** For a declared release cohort with identical named
+  address-critical inputs, the bootstrap deployer, bootstrap, library,
+  implementation, Settlers, trust timelock, Factory, and modules have identical
+  predicted addresses on every chain. The bootstrap deployer is CREATE2 from
+  the verified common EIP-2470 root; the no-argument bootstrap is CREATE2 from
+  that deployer; child CREATE2 outputs use exact initcode and fixed salts; the
+  Factory remains CREATE from bootstrap nonce 6. The cohort must bind the same
+  deterministic-root runtime hash even when the root address matches.
+  Config/artifact commitments, chain/profile, operational signer nonces, other
+  chain-local runtime-codehash evidence, M2, and treasury do not enter singleton
+  address formulas. A fixed owner's CWIA clone additionally requires equal
+  Factory, implementation, owner, and registry.
+- **Why:** A locally correct deployment can still break SDK, relayer,
+  monitoring, and operator assumptions when the same logical singleton or user
+  clone has a different cross-chain address. Separating typed address inputs
+  from chain-local semantic evidence prevents raw-initcode comparisons from
+  hiding which dependency broke parity.
+- **Throw site:** `DeployStaging._validate` rejects root runtime/profile
+  mismatches; `_compareConfigParity` rejects a different root runtime
+  commitment and reports the exact component plus named address input,
+  salt/nonce, creation-code hash, or predicted-address mismatch; `_apply`
+  asserts `DeploymentIdentity.FACTORY_CREATION_NONCE` immediately before
+  Factory CREATE; `VerifyDeploy._assertFactoryShape` binds verification to the
+  expected chain; `VerifyDeploy._assertBootstrapTerminal` reconstructs root →
+  deployer → bootstrap provenance and the Factory CREATE address.
+- **Tests:** `test/script/DeployStaging.t.sol`
+  (`test_planSupportsReleaseCohortWithChainInvariantAddresses`,
+  `test_compareConfigParityReturnsNamedIdentityInputs`,
+  `testFuzz_compareConfigParityRejectsNamedAddressMutation`,
+  `testFuzz_compareConfigParityAllowsChainLocalEvidence`,
+  `testRevert_compareConfigParityNamesSaltMismatch`,
+  `testRevert_compareConfigParityRejectsDifferentRootRuntimeCodehash`,
+  `testRevert_compareConfigParityNamesRegistryCloneMismatch`,
+  `test_compareConfigParityAllowsM2AndTreasuryDifferences`,
+  `test_directInitializationByNonDeployerRevertsWithoutMutation`,
+  `test_postFinalizationInitializationRevertsWithoutMutation`,
+  `test_rootPredeploymentByAnotherCallerDoesNotBlockFreshDeployment`,
+  `testRevert_preflightRejectsEmptyCodeNonzeroNonceBeforeDeployment`,
+  `test_prefundedEmptyOutputDoesNotBlockFreshDeployment`,
+  `test_prefundedEmptyOutputDoesNotBlockPartialResume`,
+  `test_resumeImmediatelyBeforeFactoryDeployment`,
+  `test_resumeImmediatelyAfterFactoryDeployment`) and
+  `test/script/VerifyDeploy.t.sol` root/bootstrap-provenance, expected-chain,
+  and Factory-nonce gate tests.
 
 ### N-INV-ROLLOVER-CONTRACT-OF-IMMUTABLE-AFTER-SET
 

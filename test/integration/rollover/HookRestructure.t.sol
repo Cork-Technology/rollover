@@ -964,6 +964,57 @@ contract HookRestructureTest is FillScaffold {
         }
     }
 
+    /// @notice A module attested only for PREMIUM cannot execute in the PRE bucket.
+    function test_executeIntentCalls_premiumAttestedModule_usedInPreSlot_revertsModuleTypeMismatch()
+        public
+    {
+        erc7484.setAttestedType(address(sourceSrc), Typehashes.MODULE_TYPE_EXECUTOR);
+        RolloverTypes.OrderData memory orderData = _restructureOrder(91);
+        (
+            bytes32 orderDigest,
+            RolloverTypes.RolloverIntent memory intent,
+            bytes memory cptHolderSig
+        ) = _setupRolloverIntent(
+            orderData, _preSource(FILL), _empty(), _postConsume(FILL), _empty()
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CorkRolloverContract__ModuleTypeMismatch.selector,
+                address(sourceSrc),
+                Typehashes.MODULE_TYPE_PRE_ROLLOVER_HOOK
+            )
+        );
+        _fillRollover(orderDigest, orderData, intent, cptHolderSig, FILL);
+    }
+
+    /// @notice A module attested only for PRE cannot execute in the MID bucket.
+    function test_executeIntentCalls_preAttestedModule_usedInMidSlot_revertsModuleTypeMismatch()
+        public
+    {
+        erc7484.setAttestedType(address(donateCa), Typehashes.MODULE_TYPE_PRE_ROLLOVER_HOOK);
+        RolloverTypes.Call[] memory mid = new RolloverTypes.Call[](1);
+        mid[0] = _hook(
+            address(donateCa),
+            abi.encodeWithSignature("execute(address,uint256)", address(caSrc), uint256(0))
+        );
+        RolloverTypes.OrderData memory orderData = _restructureOrder(92);
+        (
+            bytes32 orderDigest,
+            RolloverTypes.RolloverIntent memory intent,
+            bytes memory cptHolderSig
+        ) = _setupRolloverIntent(orderData, _preSource(FILL), mid, _postConsume(FILL), _empty());
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CorkRolloverContract__ModuleTypeMismatch.selector,
+                address(donateCa),
+                Typehashes.MODULE_TYPE_MID_ROLLOVER_HOOK
+            )
+        );
+        _fillRollover(orderDigest, orderData, intent, cptHolderSig, FILL);
+    }
+
     /// @notice execute intent calls pre attested module used in post slot reverts module type mismatch.
     function test_executeIntentCalls_preAttestedModule_usedInPostSlot_revertsModuleTypeMismatch()
         public
@@ -991,16 +1042,55 @@ contract HookRestructureTest is FillScaffold {
         _fillRollover(orderDigest, orderData, intent, cptHolderSig, FILL);
     }
 
+    /// @notice A module attested only for POST cannot execute in the PREMIUM bucket.
+    function test_executeIntentCalls_postAttestedModule_usedInPremiumSlot_revertsModuleTypeMismatch()
+        public
+    {
+        erc7484.setAttestedType(address(premiumRoute), Typehashes.MODULE_TYPE_POST_ROLLOVER_HOOK);
+        RolloverTypes.Call[] memory premium = new RolloverTypes.Call[](1);
+        premium[0] = _hook(
+            address(premiumRoute),
+            abi.encodeWithSignature(
+                "execute(address,address,uint256)", address(premiumToken), premiumSink, PREMIUM
+            )
+        );
+        RolloverTypes.OrderData memory orderData = _restructureOrder(94);
+        (
+            bytes32 orderDigest,
+            RolloverTypes.RolloverIntent memory intent,
+            bytes memory cptHolderSig
+        ) = _setupRolloverIntent(orderData, _preSource(FILL), _empty(), _postConsume(FILL), premium);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CorkRolloverContract__ModuleTypeMismatch.selector,
+                address(premiumRoute),
+                Typehashes.MODULE_TYPE_EXECUTOR
+            )
+        );
+        _fillRollover(orderDigest, orderData, intent, cptHolderSig, FILL);
+    }
+
     /// @notice execute intent calls check selector matches standard erc7484.
-    function test_executeIntentCalls_checkSelector_matchesStandardErc7484() public {
+    function test_executeIntentCalls_checkSelector_matchesAllRolloverBuckets() public {
+        RolloverTypes.Call[] memory mid = new RolloverTypes.Call[](1);
+        mid[0] = _hook(
+            address(donateCa),
+            abi.encodeWithSignature("execute(address,uint256)", address(caSrc), uint256(0))
+        );
+        RolloverTypes.Call[] memory premium = new RolloverTypes.Call[](1);
+        premium[0] = _hook(
+            address(premiumRoute),
+            abi.encodeWithSignature(
+                "execute(address,address,uint256)", address(premiumToken), premiumSink, PREMIUM
+            )
+        );
         RolloverTypes.OrderData memory orderData = _restructureOrder(98);
         (
             bytes32 orderDigest,
             RolloverTypes.RolloverIntent memory intent,
             bytes memory cptHolderSig
-        ) = _setupRolloverIntent(
-            orderData, _preSource(FILL), _empty(), _postConsume(FILL), _empty()
-        );
+        ) = _setupRolloverIntent(orderData, _preSource(FILL), mid, _postConsume(FILL), premium);
 
         ICorkRolloverContract.RolloverContractTrustSnapshot memory snap =
             ICorkRolloverContract(rolloverContract).rolloverContractSnapshot();
@@ -1016,13 +1106,32 @@ contract HookRestructureTest is FillScaffold {
                 snap.liveTrustThreshold
             )
         );
-
+        vm.expectCall(
+            address(erc7484),
+            abi.encodeWithSelector(
+                explicitCheckSel,
+                address(donateCa),
+                Typehashes.MODULE_TYPE_MID_ROLLOVER_HOOK,
+                snap.liveTrustAttesters,
+                snap.liveTrustThreshold
+            )
+        );
         vm.expectCall(
             address(erc7484),
             abi.encodeWithSelector(
                 explicitCheckSel,
                 address(consumeDst),
                 Typehashes.MODULE_TYPE_POST_ROLLOVER_HOOK,
+                snap.liveTrustAttesters,
+                snap.liveTrustThreshold
+            )
+        );
+        vm.expectCall(
+            address(erc7484),
+            abi.encodeWithSelector(
+                explicitCheckSel,
+                address(premiumRoute),
+                Typehashes.MODULE_TYPE_EXECUTOR,
                 snap.liveTrustAttesters,
                 snap.liveTrustThreshold
             )

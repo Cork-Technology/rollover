@@ -47,17 +47,21 @@ library Typehashes {
         "RolloverIntent(address rolloverContract,bytes32 orderDigest,uint64 deadline,uint64 nonce,Call[] preRolloverHooks,Call[] midRolloverHooks,Call[] postRolloverHooks,Call[] premiumHooks)Call(address target,uint256 value,bytes callData,bool allowFailure,bool isDelegateCall)"
     );
 
-    /// @notice ERC-7484 module-type discriminator for pre-rollover hooks.
-    ModuleType internal constant MODULE_TYPE_PRE_ROLLOVER_HOOK = ModuleType.wrap(0xc0c0_0001);
+    /// @notice Cork-local ERC-7484 authorization bucket for pre-rollover hooks.
+    /// @dev The deployed Rhinestone Registry packs module types into a `uint32` bitmap and rejects
+    ///      indices above 31. Cork allocates indices 5 through 8 to distinct Rollover phases. These
+    ///      are not standardized ERC-7579 module IDs and do not form a collision-resistant namespace;
+    ///      ERC-7579 IDs 1 through 4 remain validator, executor, fallback handler, and hook.
+    ModuleType internal constant MODULE_TYPE_PRE_ROLLOVER_HOOK = ModuleType.wrap(5);
 
-    /// @notice ERC-7484 module-type discriminator for mid-rollover hooks.
-    ModuleType internal constant MODULE_TYPE_MID_ROLLOVER_HOOK = ModuleType.wrap(0xc0c0_0002);
+    /// @notice Cork-local ERC-7484 authorization bucket for mid-rollover hooks.
+    ModuleType internal constant MODULE_TYPE_MID_ROLLOVER_HOOK = ModuleType.wrap(6);
 
-    /// @notice ERC-7484 module-type discriminator for post-rollover hooks.
-    ModuleType internal constant MODULE_TYPE_POST_ROLLOVER_HOOK = ModuleType.wrap(0xc0c0_0003);
+    /// @notice Cork-local ERC-7484 authorization bucket for post-rollover hooks.
+    ModuleType internal constant MODULE_TYPE_POST_ROLLOVER_HOOK = ModuleType.wrap(7);
 
-    /// @notice ERC-7484 module-type discriminator for premium (executor) hooks.
-    ModuleType internal constant MODULE_TYPE_EXECUTOR = ModuleType.wrap(0xc0c0_0004);
+    /// @notice Cork-local ERC-7484 authorization bucket for premium hooks.
+    ModuleType internal constant MODULE_TYPE_EXECUTOR = ModuleType.wrap(8);
 
     /// @notice EIP-712 typehash for ERC-7683 `Output`.
     bytes32 internal constant OUTPUT_TYPEHASH =

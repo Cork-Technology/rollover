@@ -498,9 +498,9 @@ adapter-context analogue at `src/EvcRolloverAdapter.sol:124`
 ### `MODULE_TYPE_PRE_ROLLOVER_HOOK` / `MID` / `POST` / `EXECUTOR`
 
 ERC-7484 `ModuleType` constants used by the rolloverContract to gate hook targets per
-phase. PRE = `0xc0c0_0001`, MID = `0xc0c0_0002`, POST = `0xc0c0_0003`,
-EXECUTOR = `0xc0c0_0004` (used for the PREMIUM phase). Re-checked live every
-phase.
+phase. PRE = `5`, MID = `6`, POST = `7`, EXECUTOR = `8` (used for the PREMIUM
+phase). These are Cork-local indices within the deployed registry's 0…31 bitmap,
+not standardized ERC-7579 module IDs. Re-checked live every phase.
 
 **Primary code site:** `src/libraries/Typehashes.sol:45-55`
 **Related terms:** `IERC7484`, `RolloverIntent`, `HookPhase`,

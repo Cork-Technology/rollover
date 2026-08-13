@@ -132,11 +132,11 @@ interface IERC7484 {
 - Vendored interface at `src/interfaces/external/erc7484/IERC7484.sol` mirrors the members Cork dereferences: `check(address, ModuleType)` at `:16`, explicit-threshold `check(address, ModuleType, address[], uint256)` at `:23`, and `trustAttesters(uint8, address[])` at `:33`.
 - `ModuleType` is a `type ... is uint256` UDVT at `src/interfaces/external/erc7484/IERC7484.sol:5` per the upstream convention.
 - Per-batch attestation enforced by `CorkRolloverContract._executeIntentCalls` via the explicit-threshold overload `IERC7484(registry).check(c.target, moduleType, attesters, threshold)` (`src/CorkRolloverContract.sol:1061`). Trust-config registration routes through `IERC7484(...).trustAttesters(threshold, attesters)` during rolloverContract initialization and factory-only trust-config application.
-- Per-bucket `ModuleType` constants defined at `src/libraries/Typehashes.sol:45-55`:
-  - `MODULE_TYPE_PRE_ROLLOVER_HOOK = 0xc0c0_0001` (`:46`)
-  - `MODULE_TYPE_MID_ROLLOVER_HOOK = 0xc0c0_0002` (`:49`)
-  - `MODULE_TYPE_POST_ROLLOVER_HOOK = 0xc0c0_0003` (`:52`)
-  - `MODULE_TYPE_EXECUTOR = 0xc0c0_0004` (`:55`)
+- Per-bucket `ModuleType` constants defined at `src/libraries/Typehashes.sol:50-64`:
+  - `MODULE_TYPE_PRE_ROLLOVER_HOOK = 5`
+  - `MODULE_TYPE_MID_ROLLOVER_HOOK = 6`
+  - `MODULE_TYPE_POST_ROLLOVER_HOOK = 7`
+  - `MODULE_TYPE_EXECUTOR = 8`
 
   Each hook list is attested under a distinct bucket so a module legitimate for one phase cannot be reused as another.
 
@@ -145,7 +145,7 @@ interface IERC7484 {
 2. **`NewTrustedAttesters` event not declared.** The upstream event fires on the registry, not on the rolloverContract; Cork relies on the registry's emission and additionally keeps an in-rolloverContract mirror.
 3. **RolloverContract mirrors the attester set.** Because the vendored interface omits attester reads, `CorkRolloverContract` stores `liveTrustThreshold` + `liveTrustAttesters` as the authoritative lens for downstream consumers.
 4. **Trust-config changes are time-locked.** Cork wraps `trustAttesters` with a queue/apply window enforced by the constructor-supplied external per-rolloverContract trust-config `TimelockController` (configured delay bounded by `MAX_TRUST_CONFIG_DELAY`, factory proposer/canceller/executor capability checked in the factory constructor). `CorkRolloverContractFactory.queueFactoryDefaultTrustConfig` snapshots current factory defaults, while `queueTrustConfig` accepts a custom config; both schedule and mirror the pending config. `applyTrustConfig` routes through `relayTrustConfig(rolloverContract, salt, threshold, attesters)` into the rolloverContract's factory-gated `setTrustConfig`, which writes through to `IERC7484.trustAttesters`. The relay succeeds only during canonical apply for the exact queued op id. The standard itself imposes no delay; Cork adds one to defend filler simulations from mid-tx attester swaps, and the timelock delay itself is mutable only through the Factory-governed delay-update path.
-5. **Module-type IDs are Cork-private.** Numeric IDs `0xc0c0_0001..0xc0c0_0004` are arbitrary Cork-private buckets layered on top of the standard `check(module, ModuleType)` overload — the registry treats them as opaque `uint256` discriminators.
+5. **Module-type IDs are Cork-local bitmap allocations.** Numeric IDs `5..8` are pairwise-distinct Rollover authorization buckets within the deployed registry's `uint32` bitmap. They are neither standardized ERC-7579 IDs nor a collision-resistant namespace; attestations must use the exact phase bucket.
 
 ### Migration / upgrade notes
 - Widening the vendored surface (e.g., adding `checkForAccount`) requires no upstream registry change but breaks the "audit-local" invariant — flag in review.
